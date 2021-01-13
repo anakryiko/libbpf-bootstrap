@@ -55,6 +55,7 @@ $(LIBBPF_OBJ): $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(OUTPU
 	$(Q)$(MAKE) -C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1		      \
 		    OBJDIR=$(dir $@)/libbpf DESTDIR=$(dir $@)		      \
 		    INCLUDEDIR= LIBDIR= UAPIDIR=			      \
+		    EXTRA_CFLAGS="-g -Og" \
 		    install
 
 # Build BPF code
@@ -79,6 +80,8 @@ $(OUTPUT)/%.o: %.c $(wildcard %.h) | $(OUTPUT)
 $(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ -lelf -lz -o $@
+
+minimal: $(OUTPUT)/trace_helpers.o
 
 # delete failed targets
 .DELETE_ON_ERROR:
