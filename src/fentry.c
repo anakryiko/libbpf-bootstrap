@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <sys/resource.h>
 #include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 #include "fentry.skel.h"
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -25,7 +26,7 @@ static void bump_memlock_rlimit(void)
 
 	if (setrlimit(RLIMIT_MEMLOCK, &rlim_new)) {
 		fprintf(stderr, "Failed to increase RLIMIT_MEMLOCK limit!\n");
-		exit(1);
+		//exit(1);
 	}
 }
 
@@ -53,6 +54,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Failed to open BPF skeleton\n");
 		return 1;
 	}
+
+	/*
+	if (bpf_map_update_elem(bpf_map__fd(skel->maps.my_map), NULL, NULL, 0)) {
+		fprintf(stderr, "Map update failed!\n");
+		return 1;
+	}
+	*/
 
 	/* Attach tracepoint handler */
 	err = fentry_bpf__attach(skel);

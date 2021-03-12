@@ -57,7 +57,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	bpf_probe_read_str(&e->filename, sizeof(e->filename), (void *)ctx + fname_off);
 
 	/* successfully submit it to user-space for post-processing */
-	bpf_ringbuf_submit(e, 0);
+	//bpf_ringbuf_submit(e, 0);
 	return 0;
 }
 

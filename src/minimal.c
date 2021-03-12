@@ -8,6 +8,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>
+#include "minimal.h"
 #include "minimal.skel.h"
 #include "trace_helpers.h"
 
@@ -60,6 +61,7 @@ struct func_info {
 	int fentry_prog_fd;
 	int fexit_prog_fd;
 	long last_call_cnt;
+	int func_flags;
 };
 
 #define MAX_FUNC_ARG_CNT 11
@@ -174,6 +176,27 @@ static bool is_ok_type(const struct btf *btf, const struct btf_type *t)
 	return true;
 }
 
+static bool is_ok_ret_type(const struct btf *btf, const struct btf_type *t)
+{
+	const struct btf_type *tt;
+
+	while (btf_is_mod(t) || btf_is_typedef(t))
+		t = btf__type_by_id(btf, t->type);
+	if (btf_is_int(t) || btf_is_enum(t))
+		return true;
+	if (!btf_is_ptr(t))
+		return false;
+
+	if (t->type == 0) 
+		return true;
+
+	tt = btf__type_by_id(btf, t->type);
+	if (!btf_is_composite(tt))
+		return false;
+
+	return true;
+}
+
 static bool is_ok_func(const struct btf *btf, const struct btf_type *t)
 {
 	const struct btf_param *p;
@@ -183,7 +206,11 @@ static bool is_ok_func(const struct btf *btf, const struct btf_type *t)
 	if (btf_vlen(t) > MAX_FUNC_ARG_CNT)
 		return false;
 
-	if (t->type && !is_ok_type(btf, btf__type_by_id(btf, t->type)))
+	/* IGNORE VOID FUNCTIONS, THIS SHOULDN'T BE DONE IN GENERAL!!! */
+	if (!t->type)
+		return false;
+
+	if (t->type && !is_ok_ret_type(btf, btf__type_by_id(btf, t->type)))
 		return false;
 
 	for (i = 0; i < btf_vlen(t); i++) {
@@ -197,6 +224,31 @@ static bool is_ok_func(const struct btf *btf, const struct btf_type *t)
 	return true;
 }
 
+static int func_flags(const char *func_name, const struct btf *btf, const struct btf_type *t)
+{
+	t = btf__type_by_id(btf, t->type);
+	if (!t->type)
+		return FUNC_CANT_FAIL;
+	t = btf__type_by_id(btf, t->type);
+
+	while (btf_is_mod(t) || btf_is_typedef(t))
+		t = btf__type_by_id(btf, t->type);
+
+	if (btf_is_ptr(t))
+		return FUNC_RET_PTR; /* can fail, no sign extension */
+
+	if (btf_is_int(t) && !(btf_int_encoding(t) & BTF_INT_SIGNED))
+		return FUNC_CANT_FAIL;
+
+	if (t->size < 4)
+		return FUNC_CANT_FAIL;
+
+	if (t->size == 4)
+		return FUNC_NEEDS_SIGN_EXT;
+
+	return 0;
+}
+
 /*
 const struct ksym *ksyms__map_addr(const struct ksyms *ksyms,
 				   unsigned long addr);
@@ -204,13 +256,56 @@ const struct ksym *ksyms__get_symbol(const struct ksyms *ksyms,
 				     const char *name);
 */
 
+static const char *entry_whitelist[] = {
+	"__x64_sys_bpf",
+	"__x64_sys_perf_event_open",
+	NULL,
+};
+
 static const char *whitelist[] = {
-	"__x64_sys_",
+	//"__x64_sys_",
+	"bpf_",
+	"_bpf_",
+	"__bpf_",
+	"__x64_sys_bpf",
+	"do_check",
+	"reg_",
+	"check_",
+	"btf_",
+	"_btf_",
+	"__btf_",
+	"find_",
+	"resolve_",
+	"convert_",
+	"release_",
+	"adjust_",
+	"verifier_",
+	"verbose_",
+	"type_",
+	"arg_",
+	"sanitize_",
+	"print_",
+	"map_",
+	"ringbuf_",
+	"array_",
+	"__vmalloc_",
+	"__alloc",
+	"pcpu_",
+	"memdup_",
+
+	"copy_",
+	"_copy_",
+	"raw_copy_",
+
+	"__x64_sys_perf_event_open",
+	"perf",
+
 	/*
 	"__x64_sys_execve",
 	"__x64_sys_fork",
 	"__x64_sys_clone",
 	*/
+
 	NULL,
 };
 
@@ -232,6 +327,12 @@ static const char *blacklist[] = {
 	"__x64_sys_select",
 	"__x64_sys_epoll_wait",
 	"__x64_sys_ppoll",
+	
+	/* too noisy */
+	"bpf_lsm_",
+	"check_cfs_rq_runtime",
+	"find_busiest_group",
+	"find_vma",
 
 	NULL,
 };
@@ -243,10 +344,62 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
+static void print_errno(long err)
+{
+	switch (err) {
+	case 0: printf("NULL"); break;
+	case -EPERM: printf("-EPERM"); break;
+	case -ENOENT: printf("-ENOENT"); break;
+	case -ENOMEM: printf("-ENOMEM"); break;
+	case -EACCES: printf("-EACCES"); break;
+	case -EFAULT: printf("-EFAULT"); break;
+	case -EINVAL: printf("-EINVAL"); break;
+	default: printf("%ld", err); break;
+	}
+}
+
+static int handle_event(void *ctx, void *data, size_t data_sz)
+{
+	const struct call_stack *s = data;
+	int i;
+
+	if (!s->is_err)
+		return 0;
+
+	printf("GOT %s STACK (depth %u):\n", s->is_err ? "ERROR" : "SUCCESS", s->max_depth);
+	printf("DEPTH %d MAX DEPTH %d SAVED DEPTH %d MAX SAVED DEPTH %d\n",
+			s->depth, s->max_depth, s->saved_depth, s->saved_max_depth);
+	for (i = 0; i < s->max_depth; i++) {
+		int id = s->func_ids[i];
+		const char *fname = func_infos[id].name;
+
+		printf("\t%s", fname);
+		if (i + 1 > s->depth) {
+			printf(" (returned ");
+			print_errno(s->func_res[i]);
+			printf(")\n");
+		} else {
+			printf(" (...)\n");
+		}
+	}
+	if (s->max_depth + 1 == s->saved_depth) {
+		for (i = s->saved_depth - 1; i < s->saved_max_depth; i++) {
+			int saved_id = s->saved_ids[i];
+			const char *fname = func_infos[saved_id].name;
+
+			printf("\t\t*%s [returned %ld]\n", fname, s->saved_res[i]);
+		}
+	}
+	printf("\n");
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int err, i, func_skip = 0, j;
 	long last_total_call_cnt = 0;
+	struct ring_buffer *rb = NULL;
 
 	ksyms = ksyms__load();
 	if (!ksyms) {
@@ -330,7 +483,7 @@ int main(int argc, char **argv)
 		if (whitelist[0]) {
 			for (j = 0; whitelist[j]; j++) {
 				if (strncmp(func_name, whitelist[j], strlen(whitelist[j])) == 0) {
-					printf("FUNC '%s' is whitelisted!\n", func_name);
+					//printf("FUNC '%s' is whitelisted!\n", func_name);
 					goto proceed;
 				}
 			}
@@ -341,7 +494,7 @@ int main(int argc, char **argv)
 proceed:
 		for (j = 0; blacklist[j]; j++) {
 			if (strncmp(func_name, blacklist[j], strlen(blacklist[j])) == 0) {
-				printf("FUNC '%s' is skipped due to blacklisting!\n", func_name);
+				//printf("FUNC '%s' is skipped due to blacklisting!\n", func_name);
 				func_skip++;
 				skip = true;
 				break;
@@ -369,6 +522,7 @@ proceed:
 		finfo->btf_id = i;
 		finfo->addr = ksym->addr;
 		finfo->name = ksym->name;
+		finfo->func_flags = func_flags(finfo->name, vmlinux_btf, t);
 
 		arg_cnt = func_arg_cnt(vmlinux_btf, i);
 		func_infos_by_arg_cnt[arg_cnt][func_info_cnts[arg_cnt]++] = finfo;
@@ -398,14 +552,30 @@ proceed:
 	}
 
 	for (i = 0; i < func_cnt; i++) {
-		err = bpf_map_update_elem(bpf_map__fd(skel->maps.ip_to_idx),
-					  &func_infos[i].addr, &i, 0);
+		const char *func_name = func_infos[i].name;
+		long func_addr = func_infos[i].addr;
+
+		err = bpf_map_update_elem(bpf_map__fd(skel->maps.ip_to_idx), &func_addr, &i, 0);
 		if (err) {
-			fprintf(stderr, "Failed to add 0x%lx -> '%s' lookup entry!\n", func_infos[i].addr, buf);
+			fprintf(stderr, "Failed to add 0x%lx -> '%s' lookup entry!\n", func_addr, buf);
 			exit(1);
 		}
 
-		strcpy(skel->bss->func_names[i], func_infos[i].name);
+		strcpy(skel->bss->func_names[i], func_name);
+		skel->bss->func_ips[i] = func_addr;
+
+		skel->bss->func_flags[i] = func_infos[i].func_flags;
+
+		for (j = 0; entry_whitelist[j]; j++) {
+			const char *name = entry_whitelist[j];
+
+			if (strncmp(func_name, name, strlen(name)) == 0) {
+				printf("FUNC '%s' is marked as an entry point!\n", name);
+				skel->bss->func_flags[i] |= FUNC_IS_ENTRY;
+				break;
+			}
+		}
+
 	}
 
 	/* Attach tracepoint handler */
@@ -444,6 +614,31 @@ proceed:
 
 	signal(SIGINT, sig_handler);
 
+	/* Set up ring buffer polling */
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
+	if (!rb) {
+		err = -1;
+		fprintf(stderr, "Failed to create ring buffer\n");
+		goto cleanup;
+	}
+
+	skel->bss->ready = true;
+
+	/* Process events */
+	printf("RECEIVING DATA...\n");
+	while (!exiting) {
+		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+		/* Ctrl-C will cause -EINTR */
+		if (err == -EINTR) {
+			err = 0;
+			goto cleanup;
+		}
+		if (err < 0) {
+			printf("Error polling perf buffer: %d\n", err);
+			goto cleanup;
+		}
+	}
+
 	while (!exiting) {
 		long total_call_cnt;
 
@@ -464,6 +659,8 @@ proceed:
 	}
 
 cleanup:
+	skel->bss->ready = false;
+
 	btf__free(vmlinux_btf);
 	ksyms__free(ksyms);
 	minimal_bpf__destroy(skel);

@@ -6,8 +6,24 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+/*
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, int);
+	__uint(value_size, 4);
+	__uint(max_entries, 1024);
+} my_map SEC(".maps");
+*/
+
+/*
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 3000);
+} my_rb SEC(".maps");
+*/
+
 SEC("fentry/do_unlinkat")
-int BPF_PROG(do_unlinkat, int dfd, struct filename *name)
+int BPF_PROG(do_unlinkat, int dfd, struct filename *name/*, int bla*/)
 {
 	const char *filename = name->name;
 	pid_t pid;
@@ -15,6 +31,19 @@ int BPF_PROG(do_unlinkat, int dfd, struct filename *name)
 	pid = bpf_get_current_pid_tgid();
 
 	bpf_printk("fentry: pid = %d, filename = %s\n", pid, filename);
+
+	/*
+	bpf_printk("bla is %d", bla);
+	*/
+	
+	/*
+	bpf_ringbuf_output(&my_rb, &pid, 4, 0);
+	*/
+
+	/*
+	bpf_map_update_elem(&my_map, &pid, &pid, 0);
+	*/
+
 	return 0;
 }
 
