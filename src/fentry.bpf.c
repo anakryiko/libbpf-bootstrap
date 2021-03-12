@@ -19,7 +19,7 @@ int BPF_PROG(do_unlinkat, int dfd, struct filename *name)
 }
 
 SEC("fexit/do_unlinkat")
-int BPF_PROG(do_unlinkat_exit, int dfd, struct filename *name, long ret)
+int BPF_PROG(do_unlinkat_exit, int dfd, struct filename *name, int bla, long ret)
 {
 	pid_t pid;
 
