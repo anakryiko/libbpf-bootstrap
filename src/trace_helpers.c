@@ -22,6 +22,7 @@
 
 struct ksyms {
 	struct ksym *syms;
+	struct ksym **syms_by_name;
 	int syms_sz;
 	int syms_cap;
 	char *strs;
@@ -79,6 +80,14 @@ static int ksym_cmp(const void *p1, const void *p2)
 	return s1->addr < s2->addr ? -1 : 1;
 }
 
+static int ksym_by_name_cmp(const void *p1, const void *p2)
+{
+	const struct ksym * const *sp1 = p1, * const *sp2 = p2;
+	const struct ksym *s1 = *sp1, *s2 = *sp2;
+
+	return strcmp(s1->name, s2->name);
+}
+
 struct ksyms *ksyms__load(void)
 {
 	char sym_type, sym_name[256];
@@ -106,11 +115,18 @@ struct ksyms *ksyms__load(void)
 			goto err_out;
 	}
 
+	ksyms->syms_by_name = calloc(ksyms->syms_sz, sizeof(*ksyms->syms_by_name));
+	if (!ksyms->syms_by_name)
+		goto err_out;
+
 	/* now when strings are finalized, adjust pointers properly */
-	for (i = 0; i < ksyms->syms_sz; i++)
+	for (i = 0; i < ksyms->syms_sz; i++) {
 		ksyms->syms[i].name += (unsigned long)ksyms->strs;
+		ksyms->syms_by_name[i] = &ksyms->syms[i];
+	}
 
 	qsort(ksyms->syms, ksyms->syms_sz, sizeof(*ksyms->syms), ksym_cmp);
+	qsort(ksyms->syms_by_name, ksyms->syms_sz, sizeof(*ksyms->syms_by_name), ksym_by_name_cmp);
 
 	fclose(f);
 	return ksyms;
@@ -156,12 +172,15 @@ const struct ksym *ksyms__map_addr(const struct ksyms *ksyms,
 const struct ksym *ksyms__get_symbol(const struct ksyms *ksyms,
 				     const char *name)
 {
-	int i;
+	struct ksym ksym = { .name = name };
+	struct ksym *key = &ksym;
+	const struct ksym **res;
 
-	for (i = 0; i < ksyms->syms_sz; i++) {
-		if (strcmp(ksyms->syms[i].name, name) == 0)
-			return &ksyms->syms[i];
-	}
+	res = bsearch(&key, ksyms->syms_by_name,
+		      ksyms->syms_sz, sizeof(*ksyms->syms_by_name),
+		      ksym_by_name_cmp);
+	if (res)
+		return *res;
 
 	return NULL;
 }

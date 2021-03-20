@@ -14,26 +14,10 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, long);
 	__type(value, unsigned);
-} ip_to_idx SEC(".maps");
+} ip_to_id SEC(".maps");
 
-
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 * 1024 * 1024);
-} rb SEC(".maps");
-
-int running[MAX_CPU_CNT] = {};
-long scratch[MAX_CPU_CNT] = {};
-int my_pid = 0;
 bool ready = false;
-
-long calls_traced = 0;
-char func_names[MAX_FUNC_CNT][64] = {};
-long func_ips[MAX_FUNC_CNT] = {};
-int func_flags[MAX_FUNC_CNT] = {};
-long func_call_cnts[MAX_FUNC_CNT] = {};
-
-struct call_stack stacks[MAX_CPU_CNT] = {};
+int running[MAX_CPU_CNT] = {};
 
 static __always_inline bool recur_enter(u32 cpu)
 {
@@ -50,41 +34,18 @@ static __always_inline void recur_exit(u32 cpu)
 	running[cpu & MAX_CPU_MASK] -= 1;
 }
 
-static __always_inline void dump_stack(const long *bp, int before, int after)
-{
-	int i = 0;
-	long val;
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 * 1024 * 1024);
+} rb SEC(".maps");
 
-	for (i = after; i >= before; i--) {
-		bpf_probe_read_kernel(&val, sizeof(val), bp + i);
-		bpf_printk("0x%lx %d: %lx", (long)bp, i * 8, val);
-	}
-}
+long scratch[MAX_CPU_CNT] = {};
 
-static __always_inline void dump_kprobe(struct pt_regs *regs)
-{
-	long tmp;
+char func_names[MAX_FUNC_CNT][64] = {};
+long func_ips[MAX_FUNC_CNT] = {};
+int func_flags[MAX_FUNC_CNT] = {};
 
-	bpf_printk("hrtimer_start_range_ns() ADDR: %lx", 0xffffffff81133ac0);
-	bpf_printk("IP: %lx, FP: %lx, SP: %lx", PT_REGS_IP(regs), PT_REGS_FP(regs), PT_REGS_SP(regs));
-	bpf_printk("STACK AT RBP");
-	dump_stack((void *)PT_REGS_FP(regs), 0, 16);
-	bpf_printk("STACK AT RSP");
-	dump_stack((void *)PT_REGS_SP(regs), 0, 16);
-
-	/*
-	bpf_probe_read(&tmp, 8, (void *)PT_REGS_FP(regs));
-	dump_stack((void *)tmp, 0, 16);
-	*/
-}
-
-static __always_inline void dump_ftrace(void *ctx)
-{
-	bpf_printk("hrtimer_start_range_ns() ADDR: %lx", 0xffffffff81133ac0);
-	bpf_printk("__x64_sys_write() ADDR: %lx", 0xffffffff812b01e0);
-	bpf_printk("CTX: %lx", (long)ctx);
-	dump_stack(ctx, 0, 16);
-}
+struct call_stack stacks[MAX_CPU_CNT] = {};
 
 static __always_inline long get_ftrace_caller_ip(void *ctx, int arg_cnt)
 {
@@ -105,37 +66,6 @@ static __always_inline long get_ftrace_caller_ip(void *ctx, int arg_cnt)
 	ip -= 5; /* compensate for 5-byte fentry stub */
 	return ip;
 }
-
-/*
-SEC("kprobe/hrtimer_start_range_ns")
-int kprobe(void *ctx)
-{
-	int pid = bpf_get_current_pid_tgid() >> 32;
-
-	if (pid != my_pid)
-		return 0;
-
-	bpf_printk("\n======================\n");
-	bpf_printk("KPROBE");
-	dump_kprobe(ctx);
-
-	return 0;
-}
-
-SEC("kretprobe/hrtimer_start_range_ns")
-int kretprobe(void *ctx)
-{
-	int pid = bpf_get_current_pid_tgid() >> 32;
-
-	if (pid != my_pid)
-		return 0;
-
-	bpf_printk("KRETPROBE");
-	dump_kprobe(ctx);
-
-	return 0;
-}
-*/
 
 static bool push_call_stack(u32 cpu, u32 id, u64 ip)
 {
@@ -266,15 +196,11 @@ static __always_inline int handle(void *ctx, int arg_cnt, bool entry)
 
 	if (!ready)
 		return 0;
-	if (my_pid && pid != my_pid)
-		return 0;
 	if (!recur_enter(cpu))
 		return 0;
 
-	__sync_fetch_and_add(&calls_traced, 1);
-
 	ip = get_ftrace_caller_ip(ctx, arg_cnt);
-	idx = bpf_map_lookup_elem(&ip_to_idx, &ip);
+	idx = bpf_map_lookup_elem(&ip_to_id, &ip);
 	if (!idx) {
 		bpf_printk("UNRECOGNIZED IP %lx", ip);
 		goto out;
@@ -285,18 +211,6 @@ static __always_inline int handle(void *ctx, int arg_cnt, bool entry)
 		bpf_printk("INVALID IDX %d FOR IP %lx", id, ip);
 		goto out;
 	}
-
-	if (entry)
-		__sync_fetch_and_add(&func_call_cnts[id], 1);
-
-	/*
-	if (entry)
-		bpf_printk("FENTRY CALLER %lx -> %s", ip, name);
-	else
-		bpf_printk("FEXIT CALLER %lx -> %s", ip, name);
-	dump_ftrace(ctx);
-	*/
-	
 
 	if (entry) {
 		push_call_stack(cpu, id, ip);
@@ -353,21 +267,3 @@ DEF_PROGS(8)
 DEF_PROGS(9)
 DEF_PROGS(10)
 DEF_PROGS(11)
-
-/*
-SEC("fentry/__x64_sys_clone")
-int BPF_PROG(handle_clone)
-{
-	__sync_fetch_and_add(&calls_traced, 1);
-	bpf_printk("CLONE CALLED!!!\n");
-	return 0;
-}
-
-SEC("fentry/__x64_sys_execve")
-int BPF_PROG(handle_execve)
-{
-	__sync_fetch_and_add(&calls_traced, 1);
-	bpf_printk("EXECVE CALLED!!!\n");
-	return 0;
-}
-*/
