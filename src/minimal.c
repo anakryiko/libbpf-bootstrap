@@ -695,7 +695,14 @@ static int hijack_prog(struct bpf_program *prog, int n,
 
 	/* By not setting res->new_insn_ptr and res->new_insns_cnt we are
 	 * preventing unnecessary load of the "prototype" BPF program.
+	 * But we do load those programs in debug mode to use libbpf's logic
+	 * of showing BPF verifier log, which is useful to debug verification
+	 * errors.
 	 */
+	if (att->debug) {
+		res->new_insn_ptr = insns;
+		res->new_insn_cnt = insns_cnt;
+	}
 
 	return 0;
 }
@@ -812,6 +819,11 @@ static int mass_attacher__attach(struct mass_attacher *att)
 		printf("Total %d functions attached successfully!\n", att->func_cnt);
 
 	return 0;
+}
+
+static struct ksyms *mass_attacher__ksyms(struct mass_attacher *att)
+{
+	return att->ksyms;
 }
 
 static struct minimal_bpf *mass_attacher__skeleton(struct mass_attacher *att)
@@ -988,7 +1000,7 @@ static const char *bpf_deny_globs[] = {
 	"bpf_lsm_*",
 	"check_cfs_rq_runtime",
 	"find_busiest_group",
-	"find_vma",
+	"find_vma*",
 
 	NULL,
 };
@@ -1017,23 +1029,66 @@ static void sig_handler(int sig)
 
 static void print_errno(long err)
 {
-	switch (err) {
-	case 0: printf("NULL"); break;
-	case -EPERM: printf("-EPERM"); break;
-	case -ENOENT: printf("-ENOENT"); break;
-	case -ENOMEM: printf("-ENOMEM"); break;
-	case -EACCES: printf("-EACCES"); break;
-	case -EFAULT: printf("-EFAULT"); break;
-	case -EINVAL: printf("-EINVAL"); break;
-	default: printf("%ld", err); break;
-	}
+	static const char *err_names[] = {
+		[1] = "EPERM", [2] = "ENOENT", [3] = "ESRCH",
+		[4] = "EINTR", [5] = "EIO", [6] = "ENXIO", [7] = "E2BIG",
+		[8] = "ENOEXEC", [9] = "EBADF", [10] = "ECHILD", [11] = "EAGAIN",
+		[12] = "ENOMEM", [13] = "EACCES", [14] = "EFAULT", [15] = "ENOTBLK",
+		[16] = "EBUSY", [17] = "EEXIST", [18] = "EXDEV", [19] = "ENODEV",
+		[20] = "ENOTDIR", [21] = "EISDIR", [22] = "EINVAL", [23] = "ENFILE",
+		[24] = "EMFILE", [25] = "ENOTTY", [26] = "ETXTBSY", [27] = "EFBIG",
+		[28] = "ENOSPC", [29] = "ESPIPE", [30] = "EROFS", [31] = "EMLINK",
+		[32] = "EPIPE", [33] = "EDOM", [34] = "ERANGE", [35] = "EDEADLK",
+		[36] = "ENAMETOOLONG", [37] = "ENOLCK", [38] = "ENOSYS", [39] = "ENOTEMPTY",
+		[40] = "ELOOP", [42] = "ENOMSG", [43] = "EIDRM", [44] = "ECHRNG",
+		[45] = "EL2NSYNC", [46] = "EL3HLT", [47] = "EL3RST", [48] = "ELNRNG",
+		[49] = "EUNATCH", [50] = "ENOCSI", [51] = "EL2HLT", [52] = "EBADE",
+		[53] = "EBADR", [54] = "EXFULL", [55] = "ENOANO", [56] = "EBADRQC",
+		[57] = "EBADSLT", [59] = "EBFONT", [60] = "ENOSTR", [61] = "ENODATA",
+		[62] = "ETIME", [63] = "ENOSR", [64] = "ENONET", [65] = "ENOPKG",
+		[66] = "EREMOTE", [67] = "ENOLINK", [68] = "EADV", [69] = "ESRMNT",
+		[70] = "ECOMM", [71] = "EPROTO", [72] = "EMULTIHOP", [73] = "EDOTDOT",
+		[74] = "EBADMSG", [75] = "EOVERFLOW", [76] = "ENOTUNIQ", [77] = "EBADFD",
+		[78] = "EREMCHG", [79] = "ELIBACC", [80] = "ELIBBAD", [81] = "ELIBSCN",
+		[82] = "ELIBMAX", [83] = "ELIBEXEC", [84] = "EILSEQ", [85] = "ERESTART",
+		[86] = "ESTRPIPE", [87] = "EUSERS", [88] = "ENOTSOCK", [89] = "EDESTADDRREQ",
+		[90] = "EMSGSIZE", [91] = "EPROTOTYPE", [92] = "ENOPROTOOPT", [93] = "EPROTONOSUPPORT",
+		[94] = "ESOCKTNOSUPPORT", [95] = "EOPNOTSUPP", [96] = "EPFNOSUPPORT", [97] = "EAFNOSUPPORT",
+		[98] = "EADDRINUSE", [99] = "EADDRNOTAVAIL", [100] = "ENETDOWN", [101] = "ENETUNREACH",
+		[102] = "ENETRESET", [103] = "ECONNABORTED", [104] = "ECONNRESET", [105] = "ENOBUFS",
+		[106] = "EISCONN", [107] = "ENOTCONN", [108] = "ESHUTDOWN", [109] = "ETOOMANYREFS",
+		[110] = "ETIMEDOUT", [111] = "ECONNREFUSED", [112] = "EHOSTDOWN", [113] = "EHOSTUNREACH",
+		[114] = "EALREADY", [115] = "EINPROGRESS", [116] = "ESTALE", [117] = "EUCLEAN",
+		[118] = "ENOTNAM", [119] = "ENAVAIL", [120] = "EISNAM", [121] = "EREMOTEIO",
+		[122] = "EDQUOT", [123] = "ENOMEDIUM", [124] = "EMEDIUMTYPE", [125] = "ECANCELED",
+		[126] = "ENOKEY", [127] = "EKEYEXPIRED", [128] = "EKEYREVOKED", [129] = "EKEYREJECTED",
+		[130] = "EOWNERDEAD", [131] = "ENOTRECOVERABLE", [132] = "ERFKILL", [133] = "EHWPOISON",
+		[512] = "ERESTARTSYS", [513] = "ERESTARTNOINTR", [514] = "ERESTARTNOHAND", [515] = "ENOIOCTLCMD",
+		[516] = "ERESTART_RESTARTBLOCK", [517] = "EPROBE_DEFER", [518] = "EOPENSTALE", [519] = "ENOPARAM",
+		[521] = "EBADHANDLE", [522] = "ENOTSYNC", [523] = "EBADCOOKIE", [524] = "ENOTSUPP",
+		[525] = "ETOOSMALL", [526] = "ESERVERFAULT", [527] = "EBADTYPE", [528] = "EJUKEBOX",
+		[529] = "EIOCBQUEUED", [530] = "ERECALLCONFLICT",
+	};
+
+	if (err < 0)
+		err = -err;
+	if (err == 0)
+		printf("NULL");
+	else if (err >= ARRAY_SIZE(err_names) || !err_names[err])
+		printf("-%ld", -err);
+	else
+		printf("-%s", err_names[err]);
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	struct mass_attacher *att = ctx;
+	struct minimal_bpf *skel = mass_attacher__skeleton(att);
+	struct ksyms *ksyms = mass_attacher__ksyms(att);
 	const struct call_stack *s = data;
-	int i;
+	const char *fname;
+	int i, n, id, flags;
+	long res;
 
 	if (!s->is_err)
 		return 0;
@@ -1041,14 +1096,20 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	printf("GOT %s STACK (depth %u):\n", s->is_err ? "ERROR" : "SUCCESS", s->max_depth);
 	printf("DEPTH %d MAX DEPTH %d SAVED DEPTH %d MAX SAVED DEPTH %d\n",
 			s->depth, s->max_depth, s->saved_depth, s->saved_max_depth);
+
 	for (i = 0; i < s->max_depth; i++) {
-		int id = s->func_ids[i];
-		const char *fname = att->func_infos[id].name;
+		id = s->func_ids[i];
+		flags = skel->bss->func_flags[id];
+		fname = att->func_infos[id].name;
 
 		printf("\t%s", fname);
 		if (i + 1 > s->depth) {
+			res = s->func_res[i];
+			if (flags & FUNC_NEEDS_SIGN_EXT)
+				res = (long)(int)res;
+
 			printf(" (returned ");
-			print_errno(s->func_res[i]);
+			print_errno(res);
 			printf(")\n");
 		} else {
 			printf(" (...)\n");
@@ -1056,12 +1117,35 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	}
 	if (s->max_depth + 1 == s->saved_depth) {
 		for (i = s->saved_depth - 1; i < s->saved_max_depth; i++) {
-			int saved_id = s->saved_ids[i];
-			const char *fname = att->func_infos[saved_id].name;
+			id = s->saved_ids[i];
+			flags = skel->bss->func_flags[id];
+			fname = att->func_infos[id].name;
 
-			printf("\t\t*%s [returned %ld]\n", fname, s->saved_res[i]);
+			res = s->saved_res[i];
+			if (flags & FUNC_NEEDS_SIGN_EXT)
+				res = (long)(int)res;
+
+			printf("\t\t*%s (returned ", fname);
+			print_errno(res);
+			printf(")\n");
 		}
 	}
+	printf("-----------------------------\n");
+	if (s->kstack_sz) {
+		printf("KSTACK (%ld items):\n", s->kstack_sz / 8);
+		for (i = 0, n = s->kstack_sz / 8; i < n; i++) {
+			long addr = s->kstack[i];
+			const struct ksym *ksym = ksyms__map_addr(ksyms, addr);
+
+			if (ksym) {
+				printf("\t%s+0x%lx (0x%016lx)\n", ksym->name, addr - ksym->addr, addr);
+			} else {
+				printf("\t0x%016lx\n", s->kstack[i]);
+			}
+		}
+	}
+
+	printf("===========================\n");
 	printf("\n");
 
 	return 0;
@@ -1162,8 +1246,11 @@ int main(int argc, char **argv)
 	if (err)
 		goto cleanup;
 
-	vmlinux_btf = mass_attacher__btf(att);
 	skel = mass_attacher__skeleton(att);
+	if (env.verbose)
+		skel->rodata->verbose = true;
+	
+	vmlinux_btf = mass_attacher__btf(att);
 	for (i = 0, n = mass_attacher__func_cnt(att); i < n; i++) {
 		const struct func_info *finfo;
 		const struct btf_type *t;
@@ -1171,7 +1258,7 @@ int main(int argc, char **argv)
 		__u32 flags;
 
 		finfo = mass_attacher__func(att, i);
-		t = btf__type_by_id(vmlinux_btf, i);
+		t = btf__type_by_id(vmlinux_btf, finfo->btf_id);
 		flags = func_flags(finfo->name, vmlinux_btf, t);
 
 		for (j = 0; j < env.entry_glob_cnt; j++) {

@@ -21,6 +21,9 @@ struct call_stack {
 	long saved_res[MAX_STACK_DEPTH];
 	__u32 saved_depth;
 	__u32 saved_max_depth;
+
+	long kstack[127];
+	long kstack_sz;
 };
 
 #define FUNC_IS_ENTRY 0x1
