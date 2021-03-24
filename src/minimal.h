@@ -8,22 +8,26 @@
 /* MAX_CPU_CNT needs to be power-of-2 */
 #define MAX_CPU_CNT 64
 #define MAX_CPU_MASK (MAX_CPU_CNT - 1)
-#define MAX_STACK_DEPTH 64
+#define MAX_FSTACK_DEPTH 64
+#define MAX_KSTACK_DEPTH 128
 
 struct call_stack {
-	__u32 func_ids[MAX_STACK_DEPTH];
-	long func_res[MAX_STACK_DEPTH];
+	__u16 func_ids[MAX_FSTACK_DEPTH];
+	long func_res[MAX_FSTACK_DEPTH];
+	long func_lat[MAX_FSTACK_DEPTH];
 	__u32 depth;
 	__u32 max_depth;
 	bool is_err;
 
-	__u32 saved_ids[MAX_STACK_DEPTH];
-	long saved_res[MAX_STACK_DEPTH];
+	__u16 saved_ids[MAX_FSTACK_DEPTH];
+	long saved_res[MAX_FSTACK_DEPTH];
+	long saved_lat[MAX_FSTACK_DEPTH];
 	__u32 saved_depth;
 	__u32 saved_max_depth;
 
-	long kstack[127];
+	long kstack[MAX_KSTACK_DEPTH];
 	long kstack_sz;
+
 };
 
 #define FUNC_IS_ENTRY 0x1

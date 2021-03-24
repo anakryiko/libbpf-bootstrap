@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /* Copyright (c) 2021 Facebook */
 #include <argp.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <signal.h>
 #include <string.h>
@@ -796,27 +797,27 @@ static int mass_attacher__attach(struct mass_attacher *att)
 	int i, err, prog_fd;
 
 	for (i = 0; i < att->func_cnt; i++) {
-		if (att->verbose)
+		if (att->debug)
 			printf("Attaching function '%s' (#%d at addr %lx)...\n",
-			       att->func_infos[i].name, i, att->func_infos[i].addr);
+			       att->func_infos[i].name, i + 1, att->func_infos[i].addr);
 
 		prog_fd = att->func_infos[i].fentry_prog_fd;
 		err = bpf_raw_tracepoint_open(NULL, prog_fd);
 		if (err < 0) {
 			fprintf(stderr, "Failed to attach FENTRY prog (fd %d) for func #%d (%s), skipping: %d\n",
-				prog_fd, i, att->func_infos[i].name, -errno);
+				prog_fd, i + 1, att->func_infos[i].name, -errno);
 		}
 
 		prog_fd = att->func_infos[i].fexit_prog_fd;
 		err = bpf_raw_tracepoint_open(NULL, prog_fd);
 		if (err < 0) {
 			fprintf(stderr, "Failed to attach FEXIT prog (fd %d) for func #%d (%s), skipping: %d\n",
-				prog_fd, i, att->func_infos[i].name, -errno);
+				prog_fd, i + 1, att->func_infos[i].name, -errno);
 		}
 	}
 
 	if (att->verbose)
-		printf("Total %d functions attached successfully!\n", att->func_cnt);
+		printf("Total %d BPF programs attached successfully!\n", 2 * att->func_cnt);
 
 	return 0;
 }
@@ -1027,8 +1028,7 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-static void print_errno(long err)
-{
+static const char *err_to_str(long err) {
 	static const char *err_names[] = {
 		[1] = "EPERM", [2] = "ENOENT", [3] = "ESRCH",
 		[4] = "EINTR", [5] = "EIO", [6] = "ENXIO", [7] = "E2BIG",
@@ -1072,81 +1072,329 @@ static void print_errno(long err)
 
 	if (err < 0)
 		err = -err;
-	if (err == 0)
-		printf("NULL");
-	else if (err >= ARRAY_SIZE(err_names) || !err_names[err])
-		printf("-%ld", -err);
+	if (err < ARRAY_SIZE(err_names))
+		return err_names[err];
+	return NULL;
+}
+
+struct dwime_ctx {
+	struct mass_attacher *att;
+	struct minimal_bpf *skel;
+	struct ksyms *ksyms;
+};
+
+/* fexit logical stack trace item */
+struct fstack_item {
+	const char *name;
+	long res;
+	long lat;
+	bool finished;
+	bool stitched;
+};
+
+static int filter_fstack(struct dwime_ctx *ctx, struct fstack_item *r, const struct call_stack *s)
+{
+	struct mass_attacher *att = ctx->att;
+	struct minimal_bpf *skel = ctx->skel;
+	//struct ksyms *ksyms = ctx->ksyms;
+	const struct func_info *finfo;
+	struct fstack_item *fitem;
+	const char *fname;
+	int i, id, flags, cnt;
+
+	for (i = 0, cnt = 0; i < s->max_depth; i++, cnt++) {
+		id = s->func_ids[i];
+		flags = skel->bss->func_flags[id];
+		finfo = mass_attacher__func(att, id);
+		fname = finfo->name;
+
+		fitem = &r[cnt];
+		fitem->name = fname;
+		fitem->stitched = false;
+		if (i >= s->depth) {
+			fitem->finished = true;
+			fitem->lat = s->func_lat[i];
+		} else {
+			fitem->lat = 0;
+		}
+		if (flags & FUNC_NEEDS_SIGN_EXT)
+			fitem->res = (long)(int)s->func_res[i];
+		else
+			fitem->res = s->func_res[i];
+		fitem->lat = s->func_lat[i];
+	}
+
+	/* no stitched together stack */
+	if (s->max_depth + 1 != s->saved_depth)
+		return cnt;
+
+	for (i = s->saved_depth - 1; i < s->saved_max_depth; i++, cnt++) {
+		id = s->saved_ids[i];
+		flags = skel->bss->func_flags[id];
+		finfo = mass_attacher__func(att, id);
+		fname = finfo->name;
+
+		fitem = &r[cnt];
+		fitem->name = fname;
+		fitem->stitched = true;
+		fitem->finished = true;
+		fitem->lat = s->saved_lat[i];
+		if (flags & FUNC_NEEDS_SIGN_EXT)
+			fitem->res = (long)(int)s->saved_res[i];
+		else
+			fitem->res = s->saved_res[i];
+	}
+
+	return cnt;
+}
+
+/* actual kernel stack trace item */
+struct kstack_item {
+	const struct ksym *ksym;
+	long addr;
+	bool filtered;
+};
+
+static bool is_bpf_tramp(const struct kstack_item *item)
+{
+	static char bpf_tramp_pfx[] = "bpf_trampoline_";
+
+	if (!item->ksym)
+		return false;
+
+	return strncmp(item->ksym->name, bpf_tramp_pfx, sizeof(bpf_tramp_pfx) - 1) == 0
+	       && isdigit(item->ksym->name[sizeof(bpf_tramp_pfx)]);
+}
+
+static bool is_bpf_prog(const struct kstack_item *item)
+{
+	static char bpf_prog_pfx[] = "bpf_prog_";
+
+	if (!item->ksym)
+		return false;
+
+	return strncmp(item->ksym->name, bpf_prog_pfx, sizeof(bpf_prog_pfx) - 1) == 0
+	       && isxdigit(item->ksym->name[sizeof(bpf_prog_pfx)]);
+}
+
+#define FTRACE_OFFSET 0x5
+
+static int filter_kstack(struct dwime_ctx *ctx, struct kstack_item *r, const struct call_stack *s)
+{
+	struct ksyms *ksyms = ctx->ksyms;
+	int i, n, p;
+
+	/* lookup ksyms and rever stack trace to match natural call order */
+	n = s->kstack_sz / 8;
+	for (i = 0; i < n; i++) {
+		struct kstack_item *item = &r[n - i - 1];
+
+		item->addr = s->kstack[i];
+		item->filtered = false;
+		item->ksym = ksyms__map_addr(ksyms, item->addr);
+		if (!item->ksym)
+			continue;
+	}
+
+	/* perform addiitonal post-processing to filter out bpf_trampoline and
+	 * bpf_prog symbols, fixup fexit patterns, etc
+	 */
+	for (i = 0, p = 0; i < n; i++) {
+		struct kstack_item *item = &r[p];
+
+		*item = r[i];
+
+		if (!item->ksym) {
+			p++;
+			continue;
+		}
+
+		/* Ignore bpf_trampoline frames and fix up stack traces.
+		 * When fexit program happens to be inside the stack trace,
+		 * a following stack trace pattern will be apparent (taking into account inverted order of frames
+		 * which we did few lines above):
+		 *     ffffffff8116a3d5 bpf_map_alloc_percpu+0x5
+		 *     ffffffffa16db06d bpf_trampoline_6442494949_0+0x6d
+		 *     ffffffff8116a40f bpf_map_alloc_percpu+0x3f
+		 * 
+		 * bpf_map_alloc_percpu+0x5 is real, by it just calls into the
+		 * trampoline, which them calls into original call
+		 * (bpf_map_alloc_percpu+0x3f). So the last item is what
+		 * really matters, everything else is just a distraction, so
+		 * try to detect this and filter it out. Unless we are in
+		 * verbose mode, of course, in which case we live a hint
+		 * that this would be filtered out (helps with debugging
+		 * overall), but otherwise is preserved.
+		 */
+		if (i + 2 < n && is_bpf_tramp(&r[i + 1])
+		    && r[i].ksym == r[i + 2].ksym
+		    && r[i].addr - r[i].ksym->addr == FTRACE_OFFSET) {
+			if (env.verbose) {
+				item->filtered = true;
+				p++;
+				continue;
+			}
+
+			/* skip two elements and process useful item */
+			*item = r[i + 2];
+			continue;
+		}
+
+		/* Iignore bpf_trampoline and bpf_prog in stack trace, those
+		 * are most probably part of our own instrumentation, but if
+		 * not, you can still see them in verbose mode.
+		 * Similarly, remove bpf_get_stack_raw_tp, which seems to be
+		 * always there due to call to bpf_get_stack() from BPF
+		 * program.
+		 */
+		if (is_bpf_tramp(&r[i]) || is_bpf_prog(&r[i])
+		    || strcmp(r[i].ksym->name, "bpf_get_stack_raw_tp") == 0) {
+			if (env.verbose) {
+				item->filtered = true;
+				p++;
+				continue;
+			}
+
+			if (i + 1 < n)
+				*item = r[i + 1];
+			continue;
+		}
+
+		p++;
+	}
+
+	return p;
+}
+
+static void print_item(const struct fstack_item *fitem, const struct kstack_item *kitem)
+{
+	const int err_width = 12;
+	const int lat_width = 12;
+
+	/* this should be rare, either a bug or we couldn't get valid kernel
+	 * stack trace
+	 */
+	if (!kitem)
+		printf("!");
 	else
-		printf("-%s", err_names[err]);
+		printf(" ");
+
+	printf("%c ", (fitem && fitem->stitched) ? '*' : ' ');
+
+	if (fitem && !fitem->finished) {
+		printf("%*s %-*s ", lat_width, "...", err_width, "[...]");
+	} else if (fitem) {
+		printf("%*ldus ", lat_width - 2 /* for "us" */, fitem->lat / 1000);
+		if (fitem->res == 0) {
+			printf("%-*s ", err_width, "[NULL]");
+		} else {
+			const char *errstr;
+			int print_cnt;
+
+			errstr = err_to_str(fitem->res);
+			if (errstr)
+				print_cnt = printf("[-%s]", errstr);
+			else
+				print_cnt = printf("[%ld]", fitem->res);
+			if (print_cnt >= 0)
+				printf("%*s ", err_width - print_cnt, "");
+		}
+	} else {
+		printf("%*s ", lat_width + 1 + err_width, "");
+	}
+
+	if (env.verbose) {
+		if (kitem && kitem->filtered) 
+			printf("(%016lx ", kitem->addr);
+		else if (kitem)
+			printf(" %016lx ", kitem->addr);
+		else
+			printf(" %*s ", 16, "");
+	}
+
+	if (kitem && kitem->ksym)
+		printf("%s+0x%lx", kitem->ksym->name, kitem->addr - kitem->ksym->addr);
+	else
+		printf("%s", kitem ? kitem->ksym->name : fitem->name);
+
+	if (env.verbose && kitem && kitem->filtered)
+		printf(")");
+
+	printf("\n");
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
-	struct mass_attacher *att = ctx;
-	struct minimal_bpf *skel = mass_attacher__skeleton(att);
-	struct ksyms *ksyms = mass_attacher__ksyms(att);
+	static struct fstack_item fstack[MAX_FSTACK_DEPTH];
+	static struct kstack_item kstack[MAX_KSTACK_DEPTH];
+	const struct fstack_item *fitem;
+	const struct kstack_item *kitem;
+	struct dwime_ctx *dctx = ctx;
 	const struct call_stack *s = data;
-	const char *fname;
-	int i, n, id, flags;
-	long res;
+	int i, j, fstack_n, kstack_n;
 
 	if (!s->is_err)
 		return 0;
 
-	printf("GOT %s STACK (depth %u):\n", s->is_err ? "ERROR" : "SUCCESS", s->max_depth);
-	printf("DEPTH %d MAX DEPTH %d SAVED DEPTH %d MAX SAVED DEPTH %d\n",
-			s->depth, s->max_depth, s->saved_depth, s->saved_max_depth);
-
-	for (i = 0; i < s->max_depth; i++) {
-		id = s->func_ids[i];
-		flags = skel->bss->func_flags[id];
-		fname = att->func_infos[id].name;
-
-		printf("\t%s", fname);
-		if (i + 1 > s->depth) {
-			res = s->func_res[i];
-			if (flags & FUNC_NEEDS_SIGN_EXT)
-				res = (long)(int)res;
-
-			printf(" (returned ");
-			print_errno(res);
-			printf(")\n");
-		} else {
-			printf(" (...)\n");
-		}
-	}
-	if (s->max_depth + 1 == s->saved_depth) {
-		for (i = s->saved_depth - 1; i < s->saved_max_depth; i++) {
-			id = s->saved_ids[i];
-			flags = skel->bss->func_flags[id];
-			fname = att->func_infos[id].name;
-
-			res = s->saved_res[i];
-			if (flags & FUNC_NEEDS_SIGN_EXT)
-				res = (long)(int)res;
-
-			printf("\t\t*%s (returned ", fname);
-			print_errno(res);
-			printf(")\n");
-		}
-	}
-	printf("-----------------------------\n");
-	if (s->kstack_sz) {
-		printf("KSTACK (%ld items):\n", s->kstack_sz / 8);
-		for (i = 0, n = s->kstack_sz / 8; i < n; i++) {
-			long addr = s->kstack[i];
-			const struct ksym *ksym = ksyms__map_addr(ksyms, addr);
-
-			if (ksym) {
-				printf("\t%s+0x%lx (0x%016lx)\n", ksym->name, addr - ksym->addr, addr);
-			} else {
-				printf("\t0x%016lx\n", s->kstack[i]);
-			}
-		}
+	if (env.debug) {
+		printf("GOT %s STACK (depth %u):\n", s->is_err ? "ERROR" : "SUCCESS", s->max_depth);
+		printf("DEPTH %d MAX DEPTH %d SAVED DEPTH %d MAX SAVED DEPTH %d\n",
+				s->depth, s->max_depth, s->saved_depth, s->saved_max_depth);
 	}
 
-	printf("===========================\n");
-	printf("\n");
+	fstack_n = filter_fstack(dctx, fstack, s);
+	if (fstack_n < 0) {
+		fprintf(stderr, "FAILURE DURING FILTERING FUNCTION STACK!!! %d\n", fstack_n);
+		return -1;
+	}
+	kstack_n = filter_kstack(dctx, kstack, s);
+	if (kstack_n < 0) {
+		fprintf(stderr, "FAILURE DURING FILTERING KERNEL STACK!!! %d\n", kstack_n);
+		return -1;
+	}
+	if (env.debug) {
+		printf("FSTACK (%d items):\n", fstack_n);
+		printf("KSTACK (%d items out of original %ld):\n", kstack_n, s->kstack_sz / 8);
+	}
+
+	i = 0;
+	j = 0;
+	while (i < fstack_n) {
+		fitem = &fstack[i];
+		kitem = j < kstack_n ? &kstack[j] : NULL;
+
+		if (!kitem) {
+			/* this shouldn't happen unless we got no kernel stack
+			 * or there is some bug
+			 */
+			print_item(fitem, NULL);
+			i++;
+			continue;
+		}
+
+		/* exhaust unknown kernel stack items, assuming we should find
+		 * kstack_item matching current fstack_item eventually, which
+		 * should be the case when kernel stack trace is correct
+		 */
+		if (!kitem->ksym || kitem->filtered
+		    || strcmp(kitem->ksym->name, fitem->name) != 0) {
+			print_item(NULL, kitem);
+			j++;
+			continue;
+		}
+
+		/* happy case, lots of info, yay */
+		print_item(fitem, kitem);
+		i++;
+		j++;
+		continue;
+	}
+
+	for (; j < kstack_n; j++) {
+		print_item(NULL, &kstack[j]);
+	}
+
+	printf("\n\n");
 
 	return 0;
 }
@@ -1179,12 +1427,36 @@ static int func_flags(const char *func_name, const struct btf *btf, const struct
 	return 0;
 }
 
+/*
+static int setup_lbr_perf_events(int map_fd)
+{
+	int cpu_cnt = libbpf_num_possible_cpus();
+	struct perf_event_attr attr;
+	int i;
+
+	if (cpu_cnt < 0) {
+		fprintf(stderr, "Failed to retrieve number of possible CPUs: %d\n", cpu_cnt);
+		return cpu_cnt;
+	}
+
+	for (i = 0; i < cpu_cnt; i++) {
+		memset(&attr, 0, sizeof(attr));
+		attr.size = sizeof(attr);
+		attr.type = PERF_TYPE_HARDWARE;
+		attr.config = PE
+
+		attr.sample_type = PERF_SAMPLE_BRANCH_STACK;
+	}
+}
+*/
+
 int main(int argc, char **argv)
 {
 	struct ring_buffer *rb = NULL;
 	struct mass_attacher_opts att_opts = {};
 	struct mass_attacher *att = NULL;
 	struct minimal_bpf *skel = NULL;
+	struct dwime_ctx dwime_ctx = {};
 	const struct btf *vmlinux_btf = NULL;
 	int err, i, j, k, n;
 
@@ -1291,16 +1563,27 @@ done:
 		skel->bss->func_flags[i] = flags;
 	}
 
+	err = mass_attacher__load(att);
+	if (err)
+		goto cleanup;
 
-	err = err ?: mass_attacher__load(att);
-	err = err ?: mass_attacher__attach(att);
+	err = mass_attacher__attach(att);
 	if (err)
 		goto cleanup;
 
 	signal(SIGINT, sig_handler);
 
+	dwime_ctx.att = att;
+	dwime_ctx.skel = mass_attacher__skeleton(att);
+	dwime_ctx.ksyms = ksyms__load();
+	if (!dwime_ctx.ksyms) {
+		fprintf(stderr, "Failed to load /proc/kallsyms for symbolization.\n");
+		goto cleanup;
+	}
+
+
 	/* Set up ring buffer polling */
-	rb = ring_buffer__new(bpf_map__fd(att->skel->maps.rb), handle_event, att, NULL);
+	rb = ring_buffer__new(bpf_map__fd(att->skel->maps.rb), handle_event, &dwime_ctx, NULL);
 	if (!rb) {
 		err = -1;
 		fprintf(stderr, "Failed to create ring buffer\n");
@@ -1326,6 +1609,11 @@ done:
 	}
 
 cleanup:
+	printf("Detaching, be patient...\n");
+	mass_attacher__free(att);
+
+	ksyms__free(dwime_ctx.ksyms);
+
 	for (i = 0; i < env.allow_glob_cnt; i++)
 		free(env.allow_globs[i]);
 	free(env.allow_globs);
@@ -1337,7 +1625,5 @@ cleanup:
 	free(env.entry_globs);
 	free(env.presets);
 
-	printf("Detaching, be patient...\n");
-	mass_attacher__free(att);
 	return -err;
 }

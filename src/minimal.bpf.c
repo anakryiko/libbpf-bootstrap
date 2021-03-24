@@ -134,6 +134,37 @@ int func_flags[MAX_FUNC_CNT] = {};
 struct call_stack stacks[MAX_CPU_CNT] = {};
 long scratch[MAX_CPU_CNT] = {};
 
+static void save_stitch_stack(struct call_stack *stack)
+{
+	if (verbose) {
+		bpf_printk("CURRENT DEPTH %d..%d", stack->depth, stack->max_depth);
+		bpf_printk("SAVED DEPTH %d..%d", stack->saved_depth, stack->saved_max_depth);
+	}
+
+	if (!stack->saved_depth || stack->max_depth + 1 != stack->saved_depth) {
+		bpf_probe_read(stack->saved_ids, sizeof(stack->saved_ids), stack->func_ids);
+		bpf_probe_read(stack->saved_res, sizeof(stack->saved_res), stack->func_res);
+		bpf_probe_read(stack->saved_lat, sizeof(stack->saved_lat), stack->func_lat);
+		stack->saved_depth = stack->depth + 1;
+		stack->saved_max_depth = stack->max_depth;
+		if (verbose)
+			bpf_printk("RESETTING SAVED ERR STACK\n");
+	} else {
+		bpf_probe_read(stack->saved_ids, sizeof(stack->saved_ids), stack->func_ids);
+		bpf_probe_read(stack->saved_res, sizeof(stack->saved_res), stack->func_res);
+		bpf_probe_read(stack->saved_lat, sizeof(stack->saved_lat), stack->func_lat);
+		stack->saved_depth = stack->depth + 1;
+		stack->saved_max_depth = stack->max_depth;
+		if (verbose)
+			bpf_printk("NEED TO APPEND BUT RESETTING SAVED ERR STACK\n");
+	}
+	/* we are partially overriding previous stack, so emit error
+	 * stack, if present
+	 */
+	//bpf_printk("CPU %d EMITTING ERROR STACK (DEPTH %d MAX DEPTH %d)!!!", cpu, stack->depth, stack->max_depth);
+	//bpf_ringbuf_output(&rb, stack, sizeof(*stack), 0);
+}
+
 static bool push_call_stack(u32 cpu, u32 id, u64 ip)
 {
 	struct call_stack *stack = &stacks[cpu & MAX_CPU_MASK];
@@ -142,45 +173,27 @@ static bool push_call_stack(u32 cpu, u32 id, u64 ip)
 	if (d == 0 && !(func_flags[id & MAX_FUNC_MASK] & FUNC_IS_ENTRY))
 		return false;
 
-	if (d >= MAX_STACK_DEPTH)
+	if (d >= MAX_FSTACK_DEPTH)
 		return false;
 
-	if (stack->depth != stack->max_depth && stack->is_err) {
-		if (verbose) {
-			bpf_printk("CURRENT DEPTH %d..%d", stack->depth, stack->max_depth);
-			bpf_printk("SAVED DEPTH %d..%d", stack->saved_depth, stack->saved_max_depth);
-		}
+	if (stack->depth != stack->max_depth && stack->is_err)
+		save_stitch_stack(stack);
 
-		if (!stack->saved_depth || stack->max_depth + 1 != stack->saved_depth) {
-			bpf_probe_read(stack->saved_ids, sizeof(stack->saved_ids), stack->func_ids);
-			bpf_probe_read(stack->saved_res, sizeof(stack->saved_res), stack->func_res);
-			stack->saved_depth = stack->depth + 1;
-			stack->saved_max_depth = stack->max_depth;
-			if (verbose)
-				bpf_printk("RESETTING SAVED ERR STACK\n");
-		} else {
-			bpf_probe_read(stack->saved_ids, sizeof(stack->saved_ids), stack->func_ids);
-			bpf_probe_read(stack->saved_res, sizeof(stack->saved_res), stack->func_res);
-			stack->saved_depth = stack->depth + 1;
-			stack->saved_max_depth = stack->max_depth;
-			if (verbose)
-				bpf_printk("NEED TO APPEND BUT RESETTING SAVED ERR STACK\n");
-		}
-		/* we are partially overriding previous stack, so emit error
-		 * stack, if present
-		 */
-		//bpf_printk("CPU %d EMITTING ERROR STACK (DEPTH %d MAX DEPTH %d)!!!", cpu, stack->depth, stack->max_depth);
-		//bpf_ringbuf_output(&rb, stack, sizeof(*stack), 0);
-	}
+	/*
+	barrier_var(d);
+	if (d >= MAX_FSTACK_DEPTH)
+		return false;
+	*/
 
 	stack->func_ids[d] = id;
 	stack->is_err = false;
 	stack->depth = d + 1;
 	stack->max_depth = d + 1;
+	stack->func_lat[d] = bpf_ktime_get_ns();
 
 	if (verbose) {
 		bpf_printk("PUSH(1) cpu %d depth %d name %s", cpu, d + 1, func_names[id & MAX_FUNC_MASK]);
-		//bpf_printk("PUSH(2) id %d addr %lx name %s", id, ip, func_names[id & MAX_FUNC_MASK]);
+		bpf_printk("PUSH(2) id %d addr %lx name %s", id, ip, func_names[id & MAX_FUNC_MASK]);
 	}
 
 	return true;
@@ -198,7 +211,9 @@ static __always_inline bool pop_call_stack(void *ctx, u32 cpu, u32 id, u64 ip, l
 		return false;
  
 	d -= 1;
-	if (d >= MAX_STACK_DEPTH)
+
+	barrier_var(d);
+	if (d >= MAX_FSTACK_DEPTH)
 		return false;
 
 	if (verbose) {
@@ -232,6 +247,7 @@ static __always_inline bool pop_call_stack(void *ctx, u32 cpu, u32 id, u64 ip, l
 	}
 
 	stack->func_res[d] = res;
+	stack->func_lat[d] = bpf_ktime_get_ns() - stack->func_lat[d];
 
 	if (is_err && !stack->is_err) {
 		stack->is_err = true;
