@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /* Copyright (c) 2021 Facebook */
+#define _XOPEN_SOURCE
+#define _GNU_SOURCE
+#include <termios.h>
+#include <fcntl.h>
+#include <stdlib.h>
+
 #include <argp.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -15,12 +21,26 @@
 #include "minimal.skel.h"
 #include "trace_helpers.h"
 
+struct symb_resp
+{
+	char fname[128];
+	char line[512];
+};
+
+struct addr2line;
+static void addr2line__free(struct addr2line *a2l);
+static struct addr2line *addr2line__init(const char *filename, const char *vmlinux, bool inlines);
+static int addr2line__symbolize(const struct addr2line *a2l, long addr, struct symb_resp *resp);
+
 #define ARRAY_SIZE(arr) (sizeof(arr)/sizeof(arr[0]))
 
 static struct env {
 	bool verbose;
 	bool debug;
 	bool debug_libbpf;
+	bool symb_lines;
+	bool symb_inlines;
+	const char *vmlinux_path;
 
 	const struct preset **presets;
 	char **allow_globs;
@@ -51,6 +71,10 @@ static const struct argp_option opts[] = {
 	  "Glob for allowed functions captured in error stack trace collection" },
 	{ "deny", 'd', "GLOB", 0,
 	  "Glob for denied functions ignored during error stack trace collection" },
+	{ "kernel", 'k', "PATH", 0,
+	  "Path to vmlinux image with DWARF information embedded" },
+	{ "symbolize", 's', "LEVEL", OPTION_ARG_OPTIONAL,
+	  "Perform extra (more expensive) symbolization (-s gives line numbers, -ss gives also inline symbols). Relies on having vmlinux with DWARF available." },
 	{},
 };
 
@@ -143,6 +167,22 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return -ENOMEM;
 		env.entry_globs = tmp;
 		env.entry_globs[env.entry_glob_cnt++] = s;
+		break;
+	case 's':
+		env.symb_lines = true;
+		if (arg) {
+			if (strcmp(arg, "s") == 0) {
+				env.symb_inlines = true;
+			} else {
+				fprintf(stderr,
+					"Unrecognized symbolization setting '%s', only -s, and -ss are supported\n",
+					arg);
+				return -EINVAL;
+			}
+		}
+		break;
+	case 'k':
+		env.vmlinux_path = arg;
 		break;
 	case ARGP_KEY_ARG:
 		argp_usage(state);
@@ -822,11 +862,6 @@ static int mass_attacher__attach(struct mass_attacher *att)
 	return 0;
 }
 
-static struct ksyms *mass_attacher__ksyms(struct mass_attacher *att)
-{
-	return att->ksyms;
-}
-
 static struct minimal_bpf *mass_attacher__skeleton(struct mass_attacher *att)
 {
 	return att->skel;
@@ -1028,59 +1063,11 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-static const char *err_to_str(long err) {
-	static const char *err_names[] = {
-		[1] = "EPERM", [2] = "ENOENT", [3] = "ESRCH",
-		[4] = "EINTR", [5] = "EIO", [6] = "ENXIO", [7] = "E2BIG",
-		[8] = "ENOEXEC", [9] = "EBADF", [10] = "ECHILD", [11] = "EAGAIN",
-		[12] = "ENOMEM", [13] = "EACCES", [14] = "EFAULT", [15] = "ENOTBLK",
-		[16] = "EBUSY", [17] = "EEXIST", [18] = "EXDEV", [19] = "ENODEV",
-		[20] = "ENOTDIR", [21] = "EISDIR", [22] = "EINVAL", [23] = "ENFILE",
-		[24] = "EMFILE", [25] = "ENOTTY", [26] = "ETXTBSY", [27] = "EFBIG",
-		[28] = "ENOSPC", [29] = "ESPIPE", [30] = "EROFS", [31] = "EMLINK",
-		[32] = "EPIPE", [33] = "EDOM", [34] = "ERANGE", [35] = "EDEADLK",
-		[36] = "ENAMETOOLONG", [37] = "ENOLCK", [38] = "ENOSYS", [39] = "ENOTEMPTY",
-		[40] = "ELOOP", [42] = "ENOMSG", [43] = "EIDRM", [44] = "ECHRNG",
-		[45] = "EL2NSYNC", [46] = "EL3HLT", [47] = "EL3RST", [48] = "ELNRNG",
-		[49] = "EUNATCH", [50] = "ENOCSI", [51] = "EL2HLT", [52] = "EBADE",
-		[53] = "EBADR", [54] = "EXFULL", [55] = "ENOANO", [56] = "EBADRQC",
-		[57] = "EBADSLT", [59] = "EBFONT", [60] = "ENOSTR", [61] = "ENODATA",
-		[62] = "ETIME", [63] = "ENOSR", [64] = "ENONET", [65] = "ENOPKG",
-		[66] = "EREMOTE", [67] = "ENOLINK", [68] = "EADV", [69] = "ESRMNT",
-		[70] = "ECOMM", [71] = "EPROTO", [72] = "EMULTIHOP", [73] = "EDOTDOT",
-		[74] = "EBADMSG", [75] = "EOVERFLOW", [76] = "ENOTUNIQ", [77] = "EBADFD",
-		[78] = "EREMCHG", [79] = "ELIBACC", [80] = "ELIBBAD", [81] = "ELIBSCN",
-		[82] = "ELIBMAX", [83] = "ELIBEXEC", [84] = "EILSEQ", [85] = "ERESTART",
-		[86] = "ESTRPIPE", [87] = "EUSERS", [88] = "ENOTSOCK", [89] = "EDESTADDRREQ",
-		[90] = "EMSGSIZE", [91] = "EPROTOTYPE", [92] = "ENOPROTOOPT", [93] = "EPROTONOSUPPORT",
-		[94] = "ESOCKTNOSUPPORT", [95] = "EOPNOTSUPP", [96] = "EPFNOSUPPORT", [97] = "EAFNOSUPPORT",
-		[98] = "EADDRINUSE", [99] = "EADDRNOTAVAIL", [100] = "ENETDOWN", [101] = "ENETUNREACH",
-		[102] = "ENETRESET", [103] = "ECONNABORTED", [104] = "ECONNRESET", [105] = "ENOBUFS",
-		[106] = "EISCONN", [107] = "ENOTCONN", [108] = "ESHUTDOWN", [109] = "ETOOMANYREFS",
-		[110] = "ETIMEDOUT", [111] = "ECONNREFUSED", [112] = "EHOSTDOWN", [113] = "EHOSTUNREACH",
-		[114] = "EALREADY", [115] = "EINPROGRESS", [116] = "ESTALE", [117] = "EUCLEAN",
-		[118] = "ENOTNAM", [119] = "ENAVAIL", [120] = "EISNAM", [121] = "EREMOTEIO",
-		[122] = "EDQUOT", [123] = "ENOMEDIUM", [124] = "EMEDIUMTYPE", [125] = "ECANCELED",
-		[126] = "ENOKEY", [127] = "EKEYEXPIRED", [128] = "EKEYREVOKED", [129] = "EKEYREJECTED",
-		[130] = "EOWNERDEAD", [131] = "ENOTRECOVERABLE", [132] = "ERFKILL", [133] = "EHWPOISON",
-		[512] = "ERESTARTSYS", [513] = "ERESTARTNOINTR", [514] = "ERESTARTNOHAND", [515] = "ENOIOCTLCMD",
-		[516] = "ERESTART_RESTARTBLOCK", [517] = "EPROBE_DEFER", [518] = "EOPENSTALE", [519] = "ENOPARAM",
-		[521] = "EBADHANDLE", [522] = "ENOTSYNC", [523] = "EBADCOOKIE", [524] = "ENOTSUPP",
-		[525] = "ETOOSMALL", [526] = "ESERVERFAULT", [527] = "EBADTYPE", [528] = "EJUKEBOX",
-		[529] = "EIOCBQUEUED", [530] = "ERECALLCONFLICT",
-	};
-
-	if (err < 0)
-		err = -err;
-	if (err < ARRAY_SIZE(err_names))
-		return err_names[err];
-	return NULL;
-}
-
 struct dwime_ctx {
 	struct mass_attacher *att;
 	struct minimal_bpf *skel;
 	struct ksyms *ksyms;
+	struct addr2line *a2l;
 };
 
 /* fexit logical stack trace item */
@@ -1096,7 +1083,6 @@ static int filter_fstack(struct dwime_ctx *ctx, struct fstack_item *r, const str
 {
 	struct mass_attacher *att = ctx->att;
 	struct minimal_bpf *skel = ctx->skel;
-	//struct ksyms *ksyms = ctx->ksyms;
 	const struct func_info *finfo;
 	struct fstack_item *fitem;
 	const char *fname;
@@ -1184,7 +1170,7 @@ static int filter_kstack(struct dwime_ctx *ctx, struct kstack_item *r, const str
 	struct ksyms *ksyms = ctx->ksyms;
 	int i, n, p;
 
-	/* lookup ksyms and rever stack trace to match natural call order */
+	/* lookup ksyms and reverse stack trace to match natural call order */
 	n = s->kstack_sz / 8;
 	for (i = 0; i < n; i++) {
 		struct kstack_item *item = &r[n - i - 1];
@@ -1266,27 +1252,109 @@ static int filter_kstack(struct dwime_ctx *ctx, struct kstack_item *r, const str
 	return p;
 }
 
-static void print_item(const struct fstack_item *fitem, const struct kstack_item *kitem)
+static const char *err_to_str(long err) {
+	static const char *err_names[] = {
+		[1] = "EPERM", [2] = "ENOENT", [3] = "ESRCH",
+		[4] = "EINTR", [5] = "EIO", [6] = "ENXIO", [7] = "E2BIG",
+		[8] = "ENOEXEC", [9] = "EBADF", [10] = "ECHILD", [11] = "EAGAIN",
+		[12] = "ENOMEM", [13] = "EACCES", [14] = "EFAULT", [15] = "ENOTBLK",
+		[16] = "EBUSY", [17] = "EEXIST", [18] = "EXDEV", [19] = "ENODEV",
+		[20] = "ENOTDIR", [21] = "EISDIR", [22] = "EINVAL", [23] = "ENFILE",
+		[24] = "EMFILE", [25] = "ENOTTY", [26] = "ETXTBSY", [27] = "EFBIG",
+		[28] = "ENOSPC", [29] = "ESPIPE", [30] = "EROFS", [31] = "EMLINK",
+		[32] = "EPIPE", [33] = "EDOM", [34] = "ERANGE", [35] = "EDEADLK",
+		[36] = "ENAMETOOLONG", [37] = "ENOLCK", [38] = "ENOSYS", [39] = "ENOTEMPTY",
+		[40] = "ELOOP", [42] = "ENOMSG", [43] = "EIDRM", [44] = "ECHRNG",
+		[45] = "EL2NSYNC", [46] = "EL3HLT", [47] = "EL3RST", [48] = "ELNRNG",
+		[49] = "EUNATCH", [50] = "ENOCSI", [51] = "EL2HLT", [52] = "EBADE",
+		[53] = "EBADR", [54] = "EXFULL", [55] = "ENOANO", [56] = "EBADRQC",
+		[57] = "EBADSLT", [59] = "EBFONT", [60] = "ENOSTR", [61] = "ENODATA",
+		[62] = "ETIME", [63] = "ENOSR", [64] = "ENONET", [65] = "ENOPKG",
+		[66] = "EREMOTE", [67] = "ENOLINK", [68] = "EADV", [69] = "ESRMNT",
+		[70] = "ECOMM", [71] = "EPROTO", [72] = "EMULTIHOP", [73] = "EDOTDOT",
+		[74] = "EBADMSG", [75] = "EOVERFLOW", [76] = "ENOTUNIQ", [77] = "EBADFD",
+		[78] = "EREMCHG", [79] = "ELIBACC", [80] = "ELIBBAD", [81] = "ELIBSCN",
+		[82] = "ELIBMAX", [83] = "ELIBEXEC", [84] = "EILSEQ", [85] = "ERESTART",
+		[86] = "ESTRPIPE", [87] = "EUSERS", [88] = "ENOTSOCK", [89] = "EDESTADDRREQ",
+		[90] = "EMSGSIZE", [91] = "EPROTOTYPE", [92] = "ENOPROTOOPT", [93] = "EPROTONOSUPPORT",
+		[94] = "ESOCKTNOSUPPORT", [95] = "EOPNOTSUPP", [96] = "EPFNOSUPPORT", [97] = "EAFNOSUPPORT",
+		[98] = "EADDRINUSE", [99] = "EADDRNOTAVAIL", [100] = "ENETDOWN", [101] = "ENETUNREACH",
+		[102] = "ENETRESET", [103] = "ECONNABORTED", [104] = "ECONNRESET", [105] = "ENOBUFS",
+		[106] = "EISCONN", [107] = "ENOTCONN", [108] = "ESHUTDOWN", [109] = "ETOOMANYREFS",
+		[110] = "ETIMEDOUT", [111] = "ECONNREFUSED", [112] = "EHOSTDOWN", [113] = "EHOSTUNREACH",
+		[114] = "EALREADY", [115] = "EINPROGRESS", [116] = "ESTALE", [117] = "EUCLEAN",
+		[118] = "ENOTNAM", [119] = "ENAVAIL", [120] = "EISNAM", [121] = "EREMOTEIO",
+		[122] = "EDQUOT", [123] = "ENOMEDIUM", [124] = "EMEDIUMTYPE", [125] = "ECANCELED",
+		[126] = "ENOKEY", [127] = "EKEYEXPIRED", [128] = "EKEYREVOKED", [129] = "EKEYREJECTED",
+		[130] = "EOWNERDEAD", [131] = "ENOTRECOVERABLE", [132] = "ERFKILL", [133] = "EHWPOISON",
+		[512] = "ERESTARTSYS", [513] = "ERESTARTNOINTR", [514] = "ERESTARTNOHAND", [515] = "ENOIOCTLCMD",
+		[516] = "ERESTART_RESTARTBLOCK", [517] = "EPROBE_DEFER", [518] = "EOPENSTALE", [519] = "ENOPARAM",
+		[521] = "EBADHANDLE", [522] = "ENOTSYNC", [523] = "EBADCOOKIE", [524] = "ENOTSUPP",
+		[525] = "ETOOSMALL", [526] = "ESERVERFAULT", [527] = "EBADTYPE", [528] = "EJUKEBOX",
+		[529] = "EIOCBQUEUED", [530] = "ERECALLCONFLICT",
+	};
+
+	if (err < 0)
+		err = -err;
+	if (err < ARRAY_SIZE(err_names))
+		return err_names[err];
+	return NULL;
+}
+
+static int detect_linux_src_loc(const char *path)
+{
+	static const char *linux_dirs[] = {
+		"arch/", "kernel/", "include/", "block/", "fs/", "net/",
+		"drivers/", "mm/", "ipc/", "security/", "lib/", "crypto/",
+		"certs/", "init/", "lib/", "scripts/", "sound/", "tools/",
+		"usr/", "virt/", 
+	};
+	int i;
+	char *p;
+
+	for (i = 0; i < ARRAY_SIZE(linux_dirs); i++) {
+		p = strstr(path, linux_dirs[i]);
+		if (p)
+			return p - path;
+	}
+
+	return 0;
+}
+
+static void print_item(struct dwime_ctx *ctx, const struct fstack_item *fitem, const struct kstack_item *kitem)
 {
 	const int err_width = 12;
 	const int lat_width = 12;
+	static struct symb_resp resps[64];
+	struct symb_resp *resp = NULL;
+	int symb_cnt = 0, i, line_off, p = 0;
+	const char *fname;
+	int src_print_off = 70, func_print_off;
+
+	if (kitem && !kitem->filtered) {
+		symb_cnt = addr2line__symbolize(ctx->a2l, kitem->addr, resps);
+		if (symb_cnt < 0)
+			symb_cnt = 0;
+		if (symb_cnt > 0)
+			resp = &resps[symb_cnt - 1];
+	}
 
 	/* this should be rare, either a bug or we couldn't get valid kernel
 	 * stack trace
 	 */
 	if (!kitem)
-		printf("!");
+		p += printf("!");
 	else
-		printf(" ");
+		p += printf(" ");
 
-	printf("%c ", (fitem && fitem->stitched) ? '*' : ' ');
+	p += printf("%c ", (fitem && fitem->stitched) ? '*' : ' ');
 
 	if (fitem && !fitem->finished) {
-		printf("%*s %-*s ", lat_width, "...", err_width, "[...]");
+		p += printf("%*s %-*s ", lat_width, "...", err_width, "[...]");
 	} else if (fitem) {
-		printf("%*ldus ", lat_width - 2 /* for "us" */, fitem->lat / 1000);
+		p += printf("%*ldus ", lat_width - 2 /* for "us" */, fitem->lat / 1000);
 		if (fitem->res == 0) {
-			printf("%-*s ", err_width, "[NULL]");
+			p += printf("%-*s ", err_width, "[NULL]");
 		} else {
 			const char *errstr;
 			int print_cnt;
@@ -1296,31 +1364,54 @@ static void print_item(const struct fstack_item *fitem, const struct kstack_item
 				print_cnt = printf("[-%s]", errstr);
 			else
 				print_cnt = printf("[%ld]", fitem->res);
-			if (print_cnt >= 0)
-				printf("%*s ", err_width - print_cnt, "");
+			p += print_cnt;
+			p += printf("%*s ", err_width - print_cnt, "");
 		}
 	} else {
-		printf("%*s ", lat_width + 1 + err_width, "");
+		p += printf("%*s ", lat_width + 1 + err_width, "");
 	}
 
 	if (env.verbose) {
 		if (kitem && kitem->filtered) 
-			printf("(%016lx ", kitem->addr);
+			p += printf("~%016lx ", kitem->addr);
 		else if (kitem)
-			printf(" %016lx ", kitem->addr);
+			p += printf(" %016lx ", kitem->addr);
 		else
-			printf(" %*s ", 16, "");
+			p += printf(" %*s ", 16, "");
 	}
 
 	if (kitem && kitem->ksym)
-		printf("%s+0x%lx", kitem->ksym->name, kitem->addr - kitem->ksym->addr);
+		fname = kitem->ksym->name;
+	else if (fitem)
+		fname = fitem->name;
 	else
-		printf("%s", kitem ? kitem->ksym->name : fitem->name);
+		fname = "";
 
-	if (env.verbose && kitem && kitem->filtered)
-		printf(")");
+	func_print_off = p;
+	p += printf("%s", fname);
+	if (kitem && kitem->ksym)
+		p += printf("+0x%lx", kitem->addr - kitem->ksym->addr);
+	if (symb_cnt) {
+		if (env.verbose)
+			src_print_off += 18; /* for extra " %16lx " */
+		p += printf(" %*s(", p < src_print_off ? src_print_off - p : 0, "");
 
-	printf("\n");
+		if (strcmp(fname, resp->fname) != 0)
+			p += printf("%s @ ", resp->fname);
+
+		line_off = detect_linux_src_loc(resp->line);
+		p += printf("%s)", resp->line + line_off);
+	}
+
+	p += printf("\n");
+
+	for (i = 1, resp--; i < symb_cnt; i++, resp--) {
+		p = printf("%*s. %s", func_print_off, "", resp->fname);
+		line_off = detect_linux_src_loc(resp->line);
+		printf(" %*s(%s)\n",
+		       p < src_print_off ? src_print_off - p : 0, "",
+		       resp->line + line_off);
+	}
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
@@ -1367,7 +1458,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			/* this shouldn't happen unless we got no kernel stack
 			 * or there is some bug
 			 */
-			print_item(fitem, NULL);
+			print_item(dctx, fitem, NULL);
 			i++;
 			continue;
 		}
@@ -1378,25 +1469,180 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		 */
 		if (!kitem->ksym || kitem->filtered
 		    || strcmp(kitem->ksym->name, fitem->name) != 0) {
-			print_item(NULL, kitem);
+			print_item(dctx, NULL, kitem);
 			j++;
 			continue;
 		}
 
 		/* happy case, lots of info, yay */
-		print_item(fitem, kitem);
+		print_item(dctx, fitem, kitem);
 		i++;
 		j++;
 		continue;
 	}
 
 	for (; j < kstack_n; j++) {
-		print_item(NULL, &kstack[j]);
+		print_item(dctx, NULL, &kstack[j]);
 	}
 
 	printf("\n\n");
 
 	return 0;
+}
+
+struct addr2line {
+	FILE *read_pipe;
+	FILE *write_pipe;
+	bool inlines;
+};
+
+static void addr2line__free(struct addr2line *a2l)
+{
+	if (!a2l)
+		return;
+
+	if (a2l->read_pipe)
+		fclose(a2l->read_pipe);
+	if (a2l->write_pipe)
+		fclose(a2l->write_pipe);
+
+	free(a2l);
+}
+
+static void sig_pipe(int signo)
+{
+	/*
+	printf("SIGPIPE caught, exiting!\n");
+	*/
+	exit(1);
+}
+
+static struct addr2line *addr2line__init(const char *filename, const char *vmlinux, bool inlines)
+{
+	struct addr2line *a2l;
+	int fd1[2], fd2[2];
+	int pid;
+	//int fd;
+
+	a2l = calloc(1, sizeof(*a2l));
+	if (!a2l)
+		return NULL;
+
+	if (signal(SIGPIPE, sig_pipe) == SIG_ERR) {
+		fprintf(stderr, "Failed to install SIGPIPE handler: %d\n", -errno);
+		goto err_out;
+	}
+
+	if (pipe(fd1) < 0 || pipe(fd2) < 0) {
+		fprintf(stderr, "Failed to create pipes for addr2line: %d\n", -errno);
+		goto err_out;
+	}
+
+//	pid = pty_fork(&fd);
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "Failed to fork() addr2line: %d\n", -errno);
+		goto err_out;
+	}
+
+	if (pid == 0) {
+		/* CHILD PROCESS */
+		//set_noecho(STDIN_FILENO);
+
+		close(fd1[1]);
+		close(fd2[0]);
+
+		if (fd1[0] != STDIN_FILENO) {
+			if (dup2(fd1[0], STDIN_FILENO) != STDIN_FILENO) {
+				fprintf(stderr, "CHILD: failed to dup2() stdin: %d\n", -errno);
+				exit(1);
+			}
+			close(fd1[0]);
+		}
+		if (fd2[1] != STDOUT_FILENO) {
+			if (dup2(fd2[1], STDOUT_FILENO) != STDOUT_FILENO) {
+				fprintf(stderr, "CHILD: failed to dup2() stdout: %d\n", -errno);
+				exit(1);
+			}
+			close(fd2[1]);
+		}
+		if (execlp("stdbuf", "-oL", "-eL", filename, "-f", "--llvm", "-e", vmlinux, inlines ? "-i" : NULL, NULL) < 0) {
+			fprintf(stderr, "CHILD: failed to exec() addr2line: %d\n", -errno);
+			exit(1);
+		}
+		exit(2); /* should never reach this */
+	}
+
+	close(fd1[0]);
+	close(fd2[1]);
+
+	/*
+	a2l->pipe = fdopen(fd, "w");
+	if (!a2l->pipe) {
+		fprintf(stderr, "Failed to fdopen() pty pipe: %d\n", -errno);
+		goto err_out;
+	}
+	*/
+	a2l->write_pipe = fdopen(fd1[1], "w");
+	if (!a2l->write_pipe) {
+		fprintf(stderr, "Failed to fdopen() write pipe: %d\n", -errno);
+		goto err_out;
+	}
+	a2l->read_pipe = fdopen(fd2[0], "r");
+	if (!a2l->read_pipe) {
+		fprintf(stderr, "Failed to fdopen() write pipe: %d\n", -errno);
+		goto err_out;
+	}
+	//loop(fd 0);
+
+	return a2l;
+
+err_out:
+	addr2line__free(a2l);
+	return NULL;
+}
+
+static int addr2line__symbolize(const struct addr2line *a2l, long addr,
+				struct symb_resp *resp)
+{
+	int err, cnt = 0;
+
+	err = fprintf(a2l->write_pipe, "%lx\n", addr);
+	if (err < 0) {
+		err = -errno;
+		fprintf(stderr, "Failed to symbolize %lx: %d\n", addr, err);
+		return err;
+	}
+	fflush(a2l->write_pipe);
+
+	while (true) {
+		if (fgets(resp->fname, sizeof(resp->fname), a2l->read_pipe) == NULL) {
+			err = -errno;
+			fprintf(stderr, "Failed to get symbolized function name: %d\n", err);
+			return err;
+		}
+		resp->fname[strlen(resp->fname) - 1] = '\0';
+
+		/* empty line denotes end of response */
+		if (resp->fname[0] == '\0')
+			break;
+
+		if (fgets(resp->line, sizeof(resp->line), a2l->read_pipe) == NULL) {
+			err = -errno;
+			fprintf(stderr, "Failed to get file/line info: %d\n", err);
+			return err;
+		}
+
+		resp->line[strlen(resp->line) - 1] = '\0';
+
+		if (strcmp(resp->line, "??:0:0") == 0)
+			continue;
+
+		resp++;
+		cnt++;
+	}
+
+	return cnt;
 }
 
 static int func_flags(const char *func_name, const struct btf *btf, const struct btf_type *t)
@@ -1427,29 +1673,6 @@ static int func_flags(const char *func_name, const struct btf *btf, const struct
 	return 0;
 }
 
-/*
-static int setup_lbr_perf_events(int map_fd)
-{
-	int cpu_cnt = libbpf_num_possible_cpus();
-	struct perf_event_attr attr;
-	int i;
-
-	if (cpu_cnt < 0) {
-		fprintf(stderr, "Failed to retrieve number of possible CPUs: %d\n", cpu_cnt);
-		return cpu_cnt;
-	}
-
-	for (i = 0; i < cpu_cnt; i++) {
-		memset(&attr, 0, sizeof(attr));
-		attr.size = sizeof(attr);
-		attr.type = PERF_TYPE_HARDWARE;
-		attr.config = PE
-
-		attr.sample_type = PERF_SAMPLE_BRANCH_STACK;
-	}
-}
-*/
-
 int main(int argc, char **argv)
 {
 	struct ring_buffer *rb = NULL;
@@ -1469,6 +1692,19 @@ int main(int argc, char **argv)
 		fprintf(stderr, "No entry point globs specified. "
 				"Please provide entry glob(s) ('-e GLOB') and/or any preset ('-p PRESET').\n");
 		return -1;
+	}
+
+	if (env.symb_lines) {
+		const char *addr2line_path = "/home/vmuser/local/libbpf-bootstrap/src/addr2line";
+		const char *vmlinux_path = "/home/vmuser/local/linux-build/default/vmlinux";
+
+		dwime_ctx.a2l = addr2line__init(addr2line_path, vmlinux_path,
+						env.symb_inlines);
+		if (!dwime_ctx.a2l) {
+			fprintf(stderr, "Failed to start %s against vmlinux image at %s!\n",
+				addr2line_path, vmlinux_path);
+			return -1;
+		}
 	}
 
 	att_opts.verbose = env.verbose;
@@ -1612,6 +1848,7 @@ cleanup:
 	printf("Detaching, be patient...\n");
 	mass_attacher__free(att);
 
+	addr2line__free(dwime_ctx.a2l);
 	ksyms__free(dwime_ctx.ksyms);
 
 	for (i = 0; i < env.allow_glob_cnt; i++)
