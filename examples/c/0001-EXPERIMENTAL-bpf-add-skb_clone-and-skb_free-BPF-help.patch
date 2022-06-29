@@ -1,0 +1,149 @@
+From 1c7fbb9e61d66b68e7c2621fdf0dca78faf2ee14 Mon Sep 17 00:00:00 2001
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Wed, 29 Jun 2022 14:55:44 -0700
+Subject: [PATCH] [EXPERIMENTAL] bpf: add skb_clone and skb_free BPF helpers
+
+This allows to keep skb_buff in kernel for later data copying to some
+specified destination. That way one can avoid unnecessary copying of
+memory from kernel to user-space just to later DMA it somewhere.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+---
+ include/linux/bpf.h      |  3 +++
+ include/uapi/linux/bpf.h | 14 ++++++++++++++
+ kernel/bpf/helpers.c     |  5 +++++
+ net/core/filter.c        | 37 ++++++++++++++++++++++++++++++++++---
+ 4 files changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index d05e1495a06e..d02b47788805 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1568,6 +1568,9 @@ extern const struct file_operations bpf_iter_fops;
+ #undef BPF_MAP_TYPE
+ #undef BPF_LINK_TYPE
+ 
++extern const struct bpf_func_proto bpf_skb_free_proto;
++extern const struct bpf_func_proto bpf_skb_load_bytes_proto;
++
+ extern const struct bpf_prog_ops bpf_offload_prog_ops;
+ extern const struct bpf_verifier_ops tc_cls_act_analyzer_ops;
+ extern const struct bpf_verifier_ops xdp_analyzer_ops;
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index e81362891596..b001375484a1 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -5325,6 +5325,18 @@ union bpf_attr {
+  *		**-EACCES** if the SYN cookie is not valid.
+  *
+  *		**-EPROTONOSUPPORT** if CONFIG_IPV6 is not builtin.
++ *
++ * struct sk_buff *bpf_skb_clone(struct sk_buff *skb)
++ * 	Description
++ * 		Clone sk_buff.
++ * 	Return
++ * 		NULL on failure, new struct sk_buff * pointer otherwise.
++ *
++ * void bpf_skb_free(struct sk_buff *skb)
++ * 	Description
++ * 		kfree_skb() given sk_buff. SUPER DANGEROUS, no safety.
++ * 	Return
++ * 		Nothing.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5535,6 +5547,8 @@ union bpf_attr {
+ 	FN(tcp_raw_gen_syncookie_ipv6),	\
+ 	FN(tcp_raw_check_syncookie_ipv4),	\
+ 	FN(tcp_raw_check_syncookie_ipv6),	\
++	FN(skb_clone),			\
++	FN(skb_free),			\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index a1c84d256f83..d8371c399642 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1679,6 +1679,11 @@ bpf_base_func_proto(enum bpf_func_id func_id)
+ 		return NULL;
+ 
+ 	switch (func_id) {
++	case BPF_FUNC_skb_load_bytes:
++		return &bpf_skb_load_bytes_proto;
++	case BPF_FUNC_skb_free:
++		return &bpf_skb_free_proto;
++
+ 	case BPF_FUNC_trace_printk:
+ 		return bpf_get_trace_printk_proto();
+ 	case BPF_FUNC_get_current_task:
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 151aa4756bd6..14ceb3f9a8f4 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -1738,14 +1738,14 @@ BPF_CALL_4(bpf_skb_load_bytes, const struct sk_buff *, skb, u32, offset,
+ 	return -EFAULT;
+ }
+ 
+-static const struct bpf_func_proto bpf_skb_load_bytes_proto = {
++const struct bpf_func_proto bpf_skb_load_bytes_proto = {
+ 	.func		= bpf_skb_load_bytes,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg1_type	= ARG_ANYTHING, /* XXX: Yeah, I know */
+ 	.arg2_type	= ARG_ANYTHING,
+ 	.arg3_type	= ARG_PTR_TO_UNINIT_MEM,
+-	.arg4_type	= ARG_CONST_SIZE,
++	.arg4_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+ BPF_CALL_4(bpf_flow_dissector_load_bytes,
+@@ -3355,6 +3355,33 @@ static const struct bpf_func_proto bpf_skb_change_type_proto = {
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ 
++BPF_CALL_1(bpf_skb_clone, struct sk_buff *, skb)
++{
++	return (long)skb_clone(skb, GFP_ATOMIC);
++}
++
++static const struct bpf_func_proto bpf_skb_clone_proto = {
++	.func		= bpf_skb_clone,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_CTX,
++};
++
++BPF_CALL_1(bpf_skb_free, struct sk_buff *, skb)
++{
++	if (!skb)
++		return -EINVAL;
++	kfree_skb(skb);
++	return 0;
++}
++
++const struct bpf_func_proto bpf_skb_free_proto = {
++	.func		= bpf_skb_free,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_ANYTHING, /* XXX: yeah, I know */
++};
++
+ static u32 bpf_skb_net_base_len(const struct sk_buff *skb)
+ {
+ 	switch (skb->protocol) {
+@@ -8091,6 +8118,10 @@ sk_skb_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 		return &bpf_skb_store_bytes_proto;
+ 	case BPF_FUNC_skb_load_bytes:
+ 		return &bpf_skb_load_bytes_proto;
++	case BPF_FUNC_skb_clone:
++		return &bpf_skb_clone_proto;
++	case BPF_FUNC_skb_free:
++		return &bpf_skb_free_proto;
+ 	case BPF_FUNC_skb_pull_data:
+ 		return &sk_skb_pull_data_proto;
+ 	case BPF_FUNC_skb_change_tail:
+-- 
+2.30.2
+
