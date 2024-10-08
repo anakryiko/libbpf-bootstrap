@@ -15,3 +15,6 @@
 /lsm
 /cmake-build-debug/
 /cmake-build-release/
+/sim
+/wprof
+/trace.json

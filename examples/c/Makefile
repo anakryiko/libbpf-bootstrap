@@ -25,13 +25,13 @@ CFLAGS := -g -Wall
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
 APPS = minimal minimal_legacy minimal_ns bootstrap uprobe kprobe fentry \
-       usdt sockfilter tc ksyscall task_iter lsm
+       usdt sockfilter tc ksyscall task_iter lsm sim
 
 CARGO ?= $(shell which cargo)
 ifeq ($(strip $(CARGO)),)
 BZS_APPS :=
 else
-BZS_APPS := profile
+BZS_APPS := profile wprof
 APPS += $(BZS_APPS)
 # Required by libblazesym
 ALL_LDFLAGS += -lrt -ldl -lpthread -lm
