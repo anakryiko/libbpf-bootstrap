@@ -14,6 +14,7 @@ struct task_state {
 	__u64 ts;
 	__u64 waking_ts;
 	__u32 waking_cpu;
+	struct wprof_task waking_task;
 	enum task_status status;
 };
 
@@ -251,9 +252,13 @@ int BPF_PROG(wprof_task_switch,
 	}
 
 	if ((e = prep_task_event(EV_SWITCH, now_ts, next))) {
-		fill_task_info(prev, &e->swtch.prev);
+		fill_task_info(prev, &e->swtch.prev_task);
 		e->swtch.waking_ts = waking_ts;
-		e->swtch.waking_cpu = snext->waking_cpu;
+		if (waking_ts) {
+			e->swtch.waking_cpu = snext->waking_cpu;
+			bpf_probe_read_kernel(&e->swtch.waking_task, sizeof(snext->waking_task),
+					      &snext->waking_task);
+		}
 		submit_event(e);
 	}
 
@@ -265,6 +270,7 @@ int BPF_PROG(wprof_task_waking, struct task_struct *p)
 {
 	struct wprof_event *e;
 	struct task_state *s;
+	struct task_struct *task = bpf_get_current_task_btf();
 	u64 now_ts;
 
 	if (!should_trace(p, NULL))
@@ -277,10 +283,14 @@ int BPF_PROG(wprof_task_waking, struct task_struct *p)
 	now_ts = bpf_ktime_get_ns();
 	s->waking_ts = now_ts;
 	s->waking_cpu = bpf_get_smp_processor_id();
+	task = bpf_get_current_task_btf();
+	fill_task_info(task, &s->waking_task);
 
+	/*
 	if ((e = prep_task_event(EV_WAKING, now_ts, p))) {
 		submit_event(e);
 	}
+	*/
 
 	return 0;
 }
@@ -307,14 +317,16 @@ int BPF_PROG(wprof_task_wakeup_new, struct task_struct *p)
 	}
 	s->status = STATUS_OFF_CPU;
 
+	/*
 	if ((e = prep_task_event(EV_WAKEUP_NEW, now_ts, p))) {
 		submit_event(e);
 	}
+	*/
 
 	return 0;
 }
 
-SEC("tp_btf/sched_wakeup")
+SEC("?tp_btf/sched_wakeup")
 int BPF_PROG(wprof_task_wakeup, struct task_struct *p)
 {
 	struct wprof_event *e;
@@ -323,10 +335,12 @@ int BPF_PROG(wprof_task_wakeup, struct task_struct *p)
 	if (!should_trace(p, NULL))
 		return 0;
 
+	/*
 	now_ts = bpf_ktime_get_ns();
 	if ((e = prep_task_event(EV_WAKEUP, now_ts, p))) {
 		submit_event(e);
 	}
+	*/
 
 	return 0;
 }

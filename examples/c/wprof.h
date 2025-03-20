@@ -72,7 +72,8 @@ struct wprof_event {
 
 	union {
 		struct wprof_switch {
-			struct wprof_task prev;
+			struct wprof_task prev_task;
+			struct wprof_task waking_task;
 			__u64 waking_ts;
 			__u32 waking_cpu;
 		} swtch;

@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
@@ -23,6 +24,8 @@
 #include "hashmap.h"
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
+#define __unused __attribute__((unused))
+#define __cleanup(fn) __attribute__((cleanup(fn)))
 
 #define DEFAULT_RINGBUF_SZ (4 * 1024 * 1024)
 #define DEFAULT_TASK_STATE_SZ 4096
@@ -223,7 +226,7 @@ static void print_frame(const char *name, uintptr_t input_addr, uintptr_t addr, 
 	}
 }
 
- __attribute__((unused))
+__unused
 static void show_stack_trace(__u64 *stack, int stack_sz, pid_t pid)
 {
 	const struct blaze_symbolize_inlined_fn* inlined;
@@ -354,7 +357,7 @@ static int trace_pid(const struct wprof_task *t)
 		return t->pid;
 }
 
-__attribute__((unused))
+__unused
 static int trace_sort_idx(const struct wprof_task *t)
 {
 	if (t->pid == 0)
@@ -379,63 +382,154 @@ static const char *trace_pcomm(const struct wprof_task *t)
 		return t->pcomm;
 }
 
+struct emit_state {
+	int level;
+	int fcnts[5]; /* field counts on each level of nestedness */
+};
+static __thread struct emit_state em;
+
+static void emit_obj_start(void)
+{
+	em.level++;
+	fprintf(env.trace, "{");
+}
+
+static void emit_obj_end(void)
+{
+	em.fcnts[em.level] = 0;
+	em.level--;
+	if (em.level == 0)
+		fprintf(env.trace, "},\n");
+	else
+		fprintf(env.trace, "}");
+}
+
+static void emit_key(const char *key)
+{
+	fprintf(env.trace, "%s\"%s\":", em.fcnts[em.level] ? "," : "", key);
+	em.fcnts[em.level]++;
+}
+
+static void emit_subobj_start(const char *key)
+{
+	emit_key(key);
+	emit_obj_start();
+}
+
+__unused
+static void emit_kv_str(const char *key, const char *value)
+{
+	emit_key(key);
+	fprintf(env.trace, "\"%s\"", value);
+}
+
+__unused
+static void emit_kv_fmt(const char *key, const char *fmt, ...)
+{
+	emit_key(key);
+
+	fprintf(env.trace, "\"");
+
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(env.trace, fmt, ap);
+	va_end(ap);
+
+	fprintf(env.trace, "\"");
+}
+
+__unused
+static void emit_kv_int(const char *key, long long value)
+{
+	emit_key(key);
+	fprintf(env.trace, "%lld", value);
+}
+
+__unused
+static void emit_kv_float(const char *key, const char *fmt, double value)
+{
+	emit_key(key);
+	fprintf(env.trace, fmt, value);
+	em.fcnts[em.level]++;
+}
+
 static int emit_trace_meta(const struct wprof_task *t)
 {
-	int ret;
 	int tid = trace_tid(t);
 	int pid = trace_pid(t);
 	const char *pcomm = trace_pcomm(t);
 	//int sort_idx = trace_sort_idx(t);
 
-	ret = fprintf(env.trace,
-		      "{\"ph\":\"M\",\"name\":\"thread_name\",\"tid\":%d,\"pid\":%d,\"args\":{\"name\":\"%s\"}},\n",
-		      tid, pid, t->comm);
-	if (ret < 0)
-		return -errno;
-	ret = fprintf(env.trace,
-		      "{\"ph\":\"M\",\"name\":\"process_name\",\"pid\":%d,\"args\":{\"name\":\"%s\"}},\n",
-		      pid, pcomm);
-	if (ret < 0)
-		return -errno;
-	/*
-	ret = fprintf(env.trace,
-		      "{\"ph\":\"M\",\"name\":\"process_sort_index\",\"pid\":%d,\"args\":{\"sort_index\":%d}},\n",
-		      pid, sort_idx);
-	if (ret < 0)
-		return -errno;
-	*/
+	emit_obj_start();
+		emit_kv_str("ph", "M");
+		emit_kv_str("name", "thread_name");
+		emit_kv_int("tid", tid);
+		emit_kv_int("pid", pid);
+		emit_key("args"); emit_obj_start();
+			emit_kv_str("name", t->comm);
+		emit_obj_end();
+	emit_obj_end();
+
+	emit_obj_start();
+		emit_kv_str("ph", "M");
+		emit_kv_str("name", "process_name");
+		emit_kv_int("pid", pid);
+		emit_key("args"); emit_obj_start();
+			emit_kv_str("name", pcomm);
+		emit_obj_end();
+	emit_obj_end();
 	return 0;
 }
 
-__attribute__((unused))
-static void emit_trace_instant(__u64 ts, const struct wprof_task *t,
-			      const char *name, const char *subname)
+struct emit_rec { bool done; };
+
+static void emit_cleanup(struct emit_rec *r)
 {
-	fprintf(env.trace,
-		"{\"ph\":\"i\",\"name\":\"%s%s%s\",\"s\":\"t\",\"ts\":%.3lf,\"tid\":%d,\"pid\":%d},\n",
-		name, subname ? ":" : "", subname ?: "",
-		(ts - env.sess_start_ts) / 1000.0,
-		trace_tid(t), trace_pid(t));
+	while (em.level)
+		emit_obj_end();
 }
 
-__attribute__((unused))
-static int emit_trace_slice_point(__u64 ts, const struct wprof_task *t,
-				  const char *name, const char *subname,
-				  const char *category, bool start)
+__unused
+static struct emit_rec emit_instant_pre(__u64 ts, const struct wprof_task *t,
+					const char *name, const char *subname)
 {
-	int ret;
-
-	ret = fprintf(env.trace,
-		      "{\"ph\":\"%c\",\"name\":\"%s%s%s\",\"cat\":\"%s\",\"ts\":%.3lf,\"tid\":%d,\"pid\":%d},\n",
-		      start ? 'B' : 'E',
-		      name, subname ? ":" : "", subname ?: "",
-		      category,
-		      (ts - env.sess_start_ts) / 1000.0,
-		      trace_tid(t), trace_pid(t));
-	if (ret < 0)
-		return -errno;
-	return 0;
+	emit_obj_start();
+		emit_kv_str("ph", "i");
+		emit_kv_float("ts", "%.3lf", (ts - env.sess_start_ts) / 1000.0);
+		emit_kv_fmt("name", "%s%s%s", name, subname ? ":" : "", subname ?: "");
+		emit_kv_str("s", "t");
+		emit_kv_int("tid", trace_tid(t));
+		emit_kv_int("pid", trace_pid(t));
+	/* ... could have args emitted afterwards */
+	return (struct emit_rec){};
 }
+
+#define emit_instant(ts, t, name, subname)							\
+	for (struct emit_rec ___r __cleanup(emit_cleanup) =					\
+	     emit_instant_pre(ts, t, name, subname);						\
+	     !___r.done; ___r.done = true)
+
+__unused
+static struct emit_rec emit_slice_point_pre(__u64 ts, const struct wprof_task *t,
+					    const char *name, const char *subname,
+					    const char *category, bool start)
+{
+	emit_obj_start();
+		emit_kv_str("ph", start ? "B" : "E");
+		emit_kv_float("ts", "%.3lf", (ts - env.sess_start_ts) / 1000.0);
+		emit_kv_fmt("name", "%s%s%s", name, subname ? ":" : "", subname ?: "");
+		emit_kv_str("cat", category);
+		emit_kv_int("tid", trace_tid(t));
+		emit_kv_int("pid", trace_pid(t));
+	/* ... could have args emitted afterwards */
+	return (struct emit_rec){};
+}
+
+#define emit_slice_point(ts, t, name, subname, category, start)					\
+	for (struct emit_rec ___r __cleanup(emit_cleanup) =					\
+	     emit_slice_point_pre(ts, t, name, subname, category, start);			\
+	     !___r.done; ___r.done = true)
+
 
 /* from include/linux/interrupt.h */
 enum irq_vec {
@@ -517,7 +611,7 @@ static int handle_event(void *_ctx, void *data, size_t size)
 	const char *status;
 	unsigned long key = task_id(e->task.pid, e->cpu_id);
 	struct task_stats *st;
-	char name_buf[256], buf[256];
+	char name_buf[256];
 	const char *name;
 
 
@@ -566,56 +660,75 @@ static int handle_event(void *_ctx, void *data, size_t size)
 			break;
 		case EV_TIMER:
 			/* task keeps running on CPU */
-			emit_trace_instant(e->ts, &e->task, "TIMER", NULL);
+			emit_instant(e->ts, &e->task, "TIMER", NULL);
 			break;
 		case EV_SWITCH: {
-			char pbuf[256];
+					/*
+			char pbuf[256], buf[256];
 			const char *pname;
 
-			pname = task_name(pbuf, sizeof(pbuf), &e->swtch.prev);
+			pname = task_name(pbuf, sizeof(pbuf), &e->swtch.prev_task);
 			snprintf(buf, sizeof(buf), "%d/%d(%s)->%d/%d(%s)",
-				 e->swtch.prev.tid, e->swtch.prev.pid, pname,
+				 e->swtch.prev_task.tid, e->swtch.prev_task.pid, pname,
 				 e->task.tid, e->task.pid, name);
+				 */
 
-			emit_trace_slice_point(e->ts, &e->swtch.prev, pname, NULL, "ONCPU", false /*!start */);
+			emit_slice_point(e->ts, &e->swtch.prev_task,
+					 e->swtch.prev_task.comm, NULL, "ONCPU", false /*!start*/) {
+				emit_subobj_start("args");
+				emit_kv_fmt("switch_to", "%s(%d/%d)",
+					    e->task.comm, trace_tid(&e->task), e->task.pid);
+			}
 		       /* !!!HACK to nest instant event at *EXACT* end of the slice within that slice,
 			* because slice's end is considered to be *EXCLUSIVE*!
 			* So, we adjust timestamp by one nanosecond BACKWARDS.
 			*/
-			emit_trace_instant(e->ts - 1, &e->swtch.prev, "SWITCH_OUT", buf);
+			//emit_instant(e->ts - 1, &e->swtch.prev_task, "SWITCH_OUT", buf);
 
-			emit_trace_slice_point(e->ts, &e->task, name, NULL, "ONCPU", true /*start*/);
-
-			emit_trace_instant(e->ts, &e->task, "SWITCH_IN", buf);
+			emit_slice_point(e->ts, &e->task, name, NULL, "ONCPU", true /*start*/) {
+				emit_subobj_start("args");
+				if (e->swtch.waking_ts) {
+					emit_kv_int("waking_cpu", e->swtch.waking_cpu);
+					emit_kv_float("waking_delay_us", "%.3lf", (e->ts - e->swtch.waking_ts) / 1000.0);
+					emit_kv_fmt("waking_from", "%s(%d/%d)",
+						    e->swtch.waking_task.comm,
+						    trace_tid(&e->swtch.waking_task), e->swtch.waking_task.pid);
+				}
+				emit_kv_fmt("switch_from", "%s(%d/%d)",
+					    e->swtch.prev_task.comm,
+					    trace_tid(&e->swtch.prev_task), e->swtch.prev_task.pid);
+				emit_kv_int("cpu", e->cpu_id);
+			}
+			//emit_instant(e->ts, &e->task, "SWITCH_IN", buf);
 			break;
 		}
 		case EV_WAKEUP:
-			emit_trace_instant(e->ts, &e->task, "WAKEUP", name);
+			emit_instant(e->ts, &e->task, "WAKEUP", name);
 			break;
 		case EV_WAKEUP_NEW:
-			emit_trace_instant(e->ts, &e->task, "WAKEUP_NEW", name);
+			emit_instant(e->ts, &e->task, "WAKEUP_NEW", name);
 			break;
 		case EV_WAKING:
-			emit_trace_instant(e->ts, &e->task, "WAKING", name);
+			emit_instant(e->ts, &e->task, "WAKING", name);
 			break;
 		case EV_EXIT:
-			emit_trace_instant(e->ts, &e->task, "EXIT", name);
+			emit_instant(e->ts, &e->task, "EXIT", name);
 			break;
 		case EV_HARDIRQ_ENTER:
 		case EV_HARDIRQ_EXIT:
-			emit_trace_slice_point(e->ts, &e->task, "HARDIRQ", e->hardirq.name,
-					       "HARDIRQ", e->kind == EV_HARDIRQ_ENTER /* start */);
+			emit_slice_point(e->ts, &e->task, "HARDIRQ", e->hardirq.name,
+					 "HARDIRQ", e->kind == EV_HARDIRQ_ENTER /* start */);
 			break;
 		case EV_SOFTIRQ_ENTER:
 		case EV_SOFTIRQ_EXIT:
-			emit_trace_slice_point(e->ts, &e->task, "SOFTIRQ", softirq_str(e->softirq.vec_nr),
-					       "SOFTIRQ",
-					       e->kind == EV_SOFTIRQ_ENTER /* start */);
+			emit_slice_point(e->ts, &e->task, "SOFTIRQ", softirq_str(e->softirq.vec_nr),
+					 "SOFTIRQ",
+					 e->kind == EV_SOFTIRQ_ENTER /* start */);
 			break;
 		case EV_WQ_START:
 		case EV_WQ_END:
-			emit_trace_slice_point(e->ts, &e->task, "WQ", e->wq.desc,
-					       "WQ", e->kind == EV_WQ_START /* start */);
+			emit_slice_point(e->ts, &e->task, "WQ", e->wq.desc,
+					 "WQ", e->kind == EV_WQ_START /* start */);
 			break;
 		default:
 			break;
