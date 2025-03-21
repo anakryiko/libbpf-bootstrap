@@ -199,6 +199,176 @@ static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid, int cpu
 	return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
+/* Copy up to sz - 1 bytes from zero-terminated src string and ensure that dst
+ * is zero-terminated string no matter what (unless sz == 0, in which case
+ * it's a no-op). It's conceptually close to FreeBSD's strlcpy(), but differs
+ * in what is returned. Given this is internal helper, it's trivial to extend
+ * this, when necessary. Use this instead of strncpy inside libbpf source code.
+ */
+static inline void strlcpy(char *dst, const char *src, size_t sz)
+{
+	size_t i;
+
+	if (sz == 0)
+		return;
+
+	sz--;
+	for (i = 0; i < sz && src[i]; i++)
+		dst[i] = src[i];
+	dst[i] = '\0';
+}
+
+#define FMT_BUF_LEVELS 4
+#define FMT_BUF_LEN 1024
+
+static __thread char fmt_bufs[FMT_BUF_LEVELS][FMT_BUF_LEN];
+static __thread int fmt_buf_idx = 0;
+
+__unused __attribute__((format(printf, 1, 2)))
+static const char *sfmt(const char *fmt, ...)
+{
+	va_list ap;
+	char *fmt_buf = fmt_bufs[fmt_buf_idx % FMT_BUF_LEVELS];
+
+	va_start(ap, fmt);
+	(void)vsnprintf(fmt_buf, FMT_BUF_LEN, fmt, ap);
+	va_end(ap);
+
+	fmt_buf_idx++;
+	return fmt_buf;
+}
+
+struct emit_state {
+	int level;
+	int fcnts[5]; /* field counts on each level of nestedness */
+	bool in_arrs[5]; /* whether we are inside the array, per-level */
+	int acnts[5]; /* array element counts, per-level */ 
+};
+
+static __thread struct emit_state em;
+
+static void emit_obj_start(void)
+{
+	em.level++;
+	fprintf(env.trace, "{");
+}
+
+static void emit_obj_end(void)
+{
+	em.fcnts[em.level] = 0;
+	em.level--;
+	if (em.level == 0)
+		fprintf(env.trace, "},\n");
+	else
+		fprintf(env.trace, "}");
+}
+
+static void emit_key(const char *key)
+{
+	fprintf(env.trace, "%s\"%s\":", em.fcnts[em.level] ? "," : "", key);
+	em.fcnts[em.level]++;
+}
+
+static void emit_subobj_start(const char *key)
+{
+	emit_key(key);
+	emit_obj_start();
+}
+
+__unused
+static void emit_kv_str(const char *key, const char *value)
+{
+	emit_key(key);
+	fprintf(env.trace, "\"%s\"", value);
+}
+
+__unused
+__attribute__((format(printf, 2, 3)))
+static void emit_kv_fmt(const char *key, const char *fmt, ...)
+{
+	emit_key(key);
+
+	fprintf(env.trace, "\"");
+
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(env.trace, fmt, ap);
+	va_end(ap);
+
+	fprintf(env.trace, "\"");
+}
+
+__unused
+static void emit_kv_int(const char *key, long long value)
+{
+	emit_key(key);
+	fprintf(env.trace, "%lld", value);
+}
+
+__unused
+static void emit_kv_float(const char *key, const char *fmt, double value)
+{
+	emit_key(key);
+	fprintf(env.trace, fmt, value);
+	em.fcnts[em.level]++;
+}
+
+/*
+static void emit_arr_start(void)
+{
+	fprintf(env.trace, "[");
+}
+
+static void emit_arr_end(void)
+{
+	fprintf(env.trace, "]");
+}
+
+__unused
+static void emit_arr_str(const char *value)
+{
+}
+
+__unused
+__attribute__((format(printf, 2, 3)))
+static void emit_kv_fmt(const char *key, const char *fmt, ...)
+{
+	emit_key(key);
+
+	fprintf(env.trace, "\"");
+
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(env.trace, fmt, ap);
+	va_end(ap);
+
+	fprintf(env.trace, "\"");
+}
+
+__unused
+static void emit_kv_int(const char *key, long long value)
+{
+	emit_key(key);
+	fprintf(env.trace, "%lld", value);
+}
+
+__unused
+static void emit_kv_float(const char *key, const char *fmt, double value)
+{
+	emit_key(key);
+	fprintf(env.trace, fmt, value);
+	em.fcnts[em.level]++;
+}
+*/
+
+struct emit_rec { bool done; };
+
+static void emit_cleanup(struct emit_rec *r)
+{
+	while (em.level)
+		emit_obj_end();
+}
+
 static struct blaze_symbolizer *symbolizer;
 
 static void print_frame(const char *name, uintptr_t input_addr, uintptr_t addr, uint64_t offset,
@@ -272,19 +442,67 @@ static void show_stack_trace(__u64 *stack, int stack_sz, pid_t pid)
 	blaze_syms_free(syms);
 }
 
-static long task_id(int pid, int cpu_id)
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
-	return pid ?: -(cpu_id + 1);
+	if (level == LIBBPF_DEBUG && !env.libbpf_logs)
+		return 0;
+	return vfprintf(stderr, format, args);
 }
 
-struct task_stats {
+static __u64 ktime_off;
+
+static inline uint64_t timespec_to_ns(struct timespec *ts)
+{
+	return ts->tv_sec * 1000000000ULL + ts->tv_nsec;
+}
+
+static void calibrate_ktime(void)
+{
+	int i;
+	struct timespec t1, t2, t3;
+	uint64_t best_delta = 0, delta, ts;
+
+	for (i = 0; i < 10; i++) {
+		clock_gettime(CLOCK_REALTIME, &t1);
+		clock_gettime(CLOCK_MONOTONIC, &t2);
+		clock_gettime(CLOCK_REALTIME, &t3);
+
+		delta = timespec_to_ns(&t3) - timespec_to_ns(&t1);
+		ts = (timespec_to_ns(&t3) + timespec_to_ns(&t1)) / 2;
+
+		if (i == 0 || delta < best_delta) {
+			best_delta = delta;
+			ktime_off = ts - timespec_to_ns(&t2);
+		}
+	}
+}
+
+static __u64 ktime_now_ns()
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+
+	return timespec_to_ns(&t);
+}
+
+static long task_id(struct wprof_task *t)
+{
+	return t->tid;
+}
+
+struct task_state {
 	int tid, pid;
+	char comm[TASK_COMM_FULL_LEN];
+	/* task renames */
+	__u64 rename_ts;
+	char old_comm[TASK_COMM_FULL_LEN];
+	/* periodic stats */
 	uint64_t on_cpu_ns;
 	uint64_t off_cpu_ns;
-	char comm[TASK_COMM_FULL_LEN];
 };
 
-static struct hashmap *stats;
+static struct hashmap *tasks;
 
 static size_t hash_identity_fn(long key, void *ctx)
 {
@@ -302,7 +520,7 @@ static void sig_timer(int sig)
 {
 	struct hashmap_entry *cur, *tmp;
 	int bkt;
-	struct task_stats *st;
+	struct task_state *st;
 
 	if (env.run_dur_ms) {
 		exiting = true;
@@ -310,8 +528,12 @@ static void sig_timer(int sig)
 	}
 
 	printf("===============================\n");
-	hashmap__for_each_entry_safe(stats, cur, tmp, bkt) {
+	hashmap__for_each_entry_safe(tasks, cur, tmp, bkt) {
 		st = cur->pvalue;
+
+		if (st->on_cpu_ns + st->off_cpu_ns == 0)
+			continue;
+
 		if (cur->key < 0) {
 			printf("IDLE #%ld: ONCPU = %.3lfms OFFCPU = %.3lfms\n",
 			       -cur->key - 1, st->on_cpu_ns / 1000000.0, st->off_cpu_ns / 1000000.0);
@@ -321,8 +543,8 @@ static void sig_timer(int sig)
 			       st->on_cpu_ns / 1000000.0, st->off_cpu_ns / 1000000.0);
 		}
 
-		free(st);
-		hashmap__delete(stats, cur->key, NULL, NULL);
+		st->on_cpu_ns = 0;
+		st->off_cpu_ns = 0;
 	}
 	printf("-------------------------------\n");
 }
@@ -342,7 +564,7 @@ enum {
 
 static int trace_tid(const struct wprof_task *t)
 {
-	return t->pid ? t->tid : -t->tid;
+	return t->pid ? t->tid : (-t->tid - 1);
 }
 
 static int trace_pid(const struct wprof_task *t)
@@ -381,154 +603,6 @@ static const char *trace_pcomm(const struct wprof_task *t)
 	else
 		return t->pcomm;
 }
-
-struct emit_state {
-	int level;
-	int fcnts[5]; /* field counts on each level of nestedness */
-};
-static __thread struct emit_state em;
-
-static void emit_obj_start(void)
-{
-	em.level++;
-	fprintf(env.trace, "{");
-}
-
-static void emit_obj_end(void)
-{
-	em.fcnts[em.level] = 0;
-	em.level--;
-	if (em.level == 0)
-		fprintf(env.trace, "},\n");
-	else
-		fprintf(env.trace, "}");
-}
-
-static void emit_key(const char *key)
-{
-	fprintf(env.trace, "%s\"%s\":", em.fcnts[em.level] ? "," : "", key);
-	em.fcnts[em.level]++;
-}
-
-static void emit_subobj_start(const char *key)
-{
-	emit_key(key);
-	emit_obj_start();
-}
-
-__unused
-static void emit_kv_str(const char *key, const char *value)
-{
-	emit_key(key);
-	fprintf(env.trace, "\"%s\"", value);
-}
-
-__unused
-static void emit_kv_fmt(const char *key, const char *fmt, ...)
-{
-	emit_key(key);
-
-	fprintf(env.trace, "\"");
-
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(env.trace, fmt, ap);
-	va_end(ap);
-
-	fprintf(env.trace, "\"");
-}
-
-__unused
-static void emit_kv_int(const char *key, long long value)
-{
-	emit_key(key);
-	fprintf(env.trace, "%lld", value);
-}
-
-__unused
-static void emit_kv_float(const char *key, const char *fmt, double value)
-{
-	emit_key(key);
-	fprintf(env.trace, fmt, value);
-	em.fcnts[em.level]++;
-}
-
-static int emit_trace_meta(const struct wprof_task *t)
-{
-	int tid = trace_tid(t);
-	int pid = trace_pid(t);
-	const char *pcomm = trace_pcomm(t);
-	//int sort_idx = trace_sort_idx(t);
-
-	emit_obj_start();
-		emit_kv_str("ph", "M");
-		emit_kv_str("name", "thread_name");
-		emit_kv_int("tid", tid);
-		emit_kv_int("pid", pid);
-		emit_key("args"); emit_obj_start();
-			emit_kv_str("name", t->comm);
-		emit_obj_end();
-	emit_obj_end();
-
-	emit_obj_start();
-		emit_kv_str("ph", "M");
-		emit_kv_str("name", "process_name");
-		emit_kv_int("pid", pid);
-		emit_key("args"); emit_obj_start();
-			emit_kv_str("name", pcomm);
-		emit_obj_end();
-	emit_obj_end();
-	return 0;
-}
-
-struct emit_rec { bool done; };
-
-static void emit_cleanup(struct emit_rec *r)
-{
-	while (em.level)
-		emit_obj_end();
-}
-
-__unused
-static struct emit_rec emit_instant_pre(__u64 ts, const struct wprof_task *t,
-					const char *name, const char *subname)
-{
-	emit_obj_start();
-		emit_kv_str("ph", "i");
-		emit_kv_float("ts", "%.3lf", (ts - env.sess_start_ts) / 1000.0);
-		emit_kv_fmt("name", "%s%s%s", name, subname ? ":" : "", subname ?: "");
-		emit_kv_str("s", "t");
-		emit_kv_int("tid", trace_tid(t));
-		emit_kv_int("pid", trace_pid(t));
-	/* ... could have args emitted afterwards */
-	return (struct emit_rec){};
-}
-
-#define emit_instant(ts, t, name, subname)							\
-	for (struct emit_rec ___r __cleanup(emit_cleanup) =					\
-	     emit_instant_pre(ts, t, name, subname);						\
-	     !___r.done; ___r.done = true)
-
-__unused
-static struct emit_rec emit_slice_point_pre(__u64 ts, const struct wprof_task *t,
-					    const char *name, const char *subname,
-					    const char *category, bool start)
-{
-	emit_obj_start();
-		emit_kv_str("ph", start ? "B" : "E");
-		emit_kv_float("ts", "%.3lf", (ts - env.sess_start_ts) / 1000.0);
-		emit_kv_fmt("name", "%s%s%s", name, subname ? ":" : "", subname ?: "");
-		emit_kv_str("cat", category);
-		emit_kv_int("tid", trace_tid(t));
-		emit_kv_int("pid", trace_pid(t));
-	/* ... could have args emitted afterwards */
-	return (struct emit_rec){};
-}
-
-#define emit_slice_point(ts, t, name, subname, category, start)					\
-	for (struct emit_rec ___r __cleanup(emit_cleanup) =					\
-	     emit_slice_point_pre(ts, t, name, subname, category, start);			\
-	     !___r.done; ___r.done = true)
 
 
 /* from include/linux/interrupt.h */
@@ -574,13 +648,17 @@ static const char *event_kind_str_map[] = {
 	[EV_WAKEUP_NEW] = "WAKEUP_NEW",
 	[EV_WAKEUP] = "WAKEUP",
 	[EV_WAKING] = "WAKING",
-	[EV_EXIT] = "EXIT",
 	[EV_HARDIRQ_ENTER] = "HARDIRQ_ENTER",
 	[EV_HARDIRQ_EXIT] = "HARDIRQ_EXIT",
 	[EV_SOFTIRQ_ENTER] = "HARDIRQ_ENTER",
 	[EV_SOFTIRQ_EXIT] = "SOFTIRQ_EXIT",
 	[EV_WQ_START] = "WQ_START",
 	[EV_WQ_END] = "WQ_END",
+	[EV_FORK] = "FORK",
+	[EV_EXEC] = "EXEC",
+	[EV_TASK_RENAME] = "TASK_RENAME",
+	[EV_TASK_EXIT] = "TASK_EXIT",
+	[EV_TASK_FREE] = "TASK_EXIT",
 };
 
 static const char *event_kind_str(enum event_kind kind)
@@ -590,18 +668,152 @@ static const char *event_kind_str(enum event_kind kind)
 	return "UNKNOWN";
 }
 
-static const char *task_name(char *buf, size_t buf_sz, const struct wprof_task *t)
+static const char *waking_reason_str(enum waking_flags flags)
 {
-	/*
-	if (t->flags & PF_WQ_WORKER) {
-		snprintf(buf, buf_sz, "W:%s", t->comm);
-		return buf;
-	} else if (t->flags & PF_KTHREAD) {
-		snprintf(buf, buf_sz, "K:%s", t->comm);
-		return buf;
+	switch (flags) {
+		case WF_UNKNOWN: return "unknown";
+		case WF_AWOKEN: return "awoken";
+		case WF_AWOKEN_NEW: return "awoken_new";
+		case WF_PREEMPTED: return "preempted";
+		default: return "???";
 	}
-	*/
-	return t->comm;
+}
+
+enum instant_scope {
+	SCOPE_THREAD,
+	SCOPE_PROCESS,
+	SCOPE_GLOBAL,
+};
+
+__unused
+static const char *scope_str_map[] = {
+	[SCOPE_THREAD] = "t",
+	[SCOPE_PROCESS] = "p",
+	[SCOPE_GLOBAL] = "g",
+};
+
+__unused
+static const char *scope_str(enum instant_scope scope)
+{
+	return scope_str_map[scope];
+}
+
+__unused
+static struct emit_rec emit_instant_pre(__u64 ts, const struct wprof_task *t,
+					const char *name, const char *subname)
+{
+	emit_obj_start();
+		emit_kv_str("ph", "i");
+		emit_kv_float("ts", "%.3lf", (ts - env.sess_start_ts) / 1000.0);
+		emit_kv_fmt("name", "%s%s%s", name, subname ? ":" : "", subname ?: "");
+		/* assume thread-scoped instant event */
+		// emit_kv_str("s", "t");
+		emit_kv_int("tid", trace_tid(t));
+		emit_kv_int("pid", trace_pid(t));
+	/* ... could have args emitted afterwards */
+	return (struct emit_rec){};
+}
+
+#define emit_instant(ts, t, name, subname)							\
+	for (struct emit_rec ___r __cleanup(emit_cleanup) =					\
+	     emit_instant_pre(ts, t, name, subname);						\
+	     !___r.done; ___r.done = true)
+
+__unused
+static struct emit_rec emit_slice_point_pre(__u64 ts, const struct wprof_task *t,
+					    const char *name, const char *subname,
+					    const char *category, bool start)
+{
+	emit_obj_start();
+		emit_kv_str("ph", start ? "B" : "E");
+		emit_kv_float("ts", "%.3lf", (ts - env.sess_start_ts) / 1000.0);
+		emit_kv_fmt("name", "%s%s%s", name, subname ? ":" : "", subname ?: "");
+		emit_kv_str("cat", category);
+		emit_kv_int("tid", trace_tid(t));
+		emit_kv_int("pid", trace_pid(t));
+	/* ... could have args emitted afterwards */
+	return (struct emit_rec){};
+}
+
+#define emit_slice_point(ts, t, name, subname, category, start)					\
+	for (struct emit_rec ___r __cleanup(emit_cleanup) =					\
+	     emit_slice_point_pre(ts, t, name, subname, category, start);			\
+	     !___r.done; ___r.done = true)
+
+static int emit_trace_meta(const struct wprof_task *t)
+{
+	int tid = trace_tid(t);
+	int pid = trace_pid(t);
+	const char *pcomm = trace_pcomm(t);
+	//int sort_idx = trace_sort_idx(t);
+	
+	emit_obj_start();
+		emit_kv_str("ph", "M");
+		emit_kv_str("name", "process_name");
+		emit_kv_int("pid", pid);
+		emit_key("args"); emit_obj_start();
+			emit_kv_str("name", pcomm);
+		emit_obj_end();
+	emit_obj_end();
+	emit_obj_start();
+		emit_kv_str("ph", "M");
+		emit_kv_str("name", "process_sort_index");
+		emit_kv_int("pid", pid);
+		emit_key("args"); emit_obj_start();
+			emit_kv_int("sort_index", pid);
+		emit_obj_end();
+	emit_obj_end();
+
+	emit_obj_start();
+		emit_kv_str("ph", "M");
+		emit_kv_str("name", "thread_name");
+		emit_kv_int("tid", tid);
+		emit_kv_int("pid", pid);
+		emit_key("args"); emit_obj_start();
+			emit_kv_str("name", t->comm);
+		emit_obj_end();
+	emit_obj_end();
+	emit_obj_start();
+		emit_kv_str("ph", "M");
+		emit_kv_str("name", "thread_sort_index");
+		emit_kv_int("tid", tid);
+		emit_kv_int("pid", pid);
+		emit_key("args"); emit_obj_start();
+			emit_kv_int("sort_index", tid);
+		emit_obj_end();
+	emit_obj_end();
+
+	return 0;
+}
+
+static struct task_state *task_state(struct wprof_task *t)
+{
+	unsigned long key = task_id(t);
+	struct task_state *st;
+
+	if (!hashmap__find(tasks, key, &st)) {
+		st = calloc(1, sizeof(*st));
+		st->tid = t->tid;
+		st->pid = t->pid;
+		strlcpy(st->comm, t->comm, sizeof(st->comm));
+
+		if (env.trace)
+			emit_trace_meta(t);
+
+		hashmap__set(tasks, key, st, NULL, NULL);
+	}
+
+	return st;
+}
+
+static void task_state_delete(struct wprof_task *t)
+{
+	unsigned long key = task_id(t);
+	struct task_state *st;
+
+	hashmap__delete(tasks, key, NULL, &st);
+
+	free(st);
 }
 
 /* Receive events from the ring buffer. */
@@ -609,25 +821,9 @@ static int handle_event(void *_ctx, void *data, size_t size)
 {
 	struct wprof_event *e = data;
 	const char *status;
-	unsigned long key = task_id(e->task.pid, e->cpu_id);
-	struct task_stats *st;
-	char name_buf[256];
-	const char *name;
+	struct task_state *st, *pst = NULL;
 
-
-	if (!hashmap__find(stats, key, &st)) {
-		st = calloc(1, sizeof(*st));
-		st->tid = e->task.tid,
-		st->pid = e->task.pid,
-		memcpy(st->comm, e->task.comm, sizeof(st->comm));
-
-		if (env.trace) {
-			if (emit_trace_meta(&e->task))
-				return -1;
-		}
-
-		hashmap__set(stats, key, st, NULL, NULL);
-	}
+	st = task_state(&e->task);
 
 	switch (e->kind) {
 	case EV_ON_CPU:
@@ -639,80 +835,131 @@ static int handle_event(void *_ctx, void *data, size_t size)
 	case EV_TIMER:
 		st->on_cpu_ns += e->dur_ns;
 		break;
+	case EV_SWITCH:
+		/* init switched-from task state, if necessary */
+		pst = task_state(&e->swtch.prev);
+		break;
+	case EV_FORK:
+		/* init forked child task state */
+		(void)task_state(&e->fork.child);
+		break;
+	case EV_TASK_RENAME:
+		if (st->rename_ts == 0) {
+			memcpy(st->old_comm, e->task.comm, sizeof(st->old_comm));
+			st->rename_ts = e->ts;
+		}
+		memcpy(st->comm, e->rename.new_comm, sizeof(st->comm));
+		break;
+	case EV_TASK_EXIT:
+		/* we still might be getting task events, too early to delete the state */
+		break;
+	case EV_TASK_FREE:
+		/* now we should be done with the task */
+		task_state_delete(&e->task);
+		break;
 	default:
 	}
-	status = event_kind_str(e->kind);
 
-	if (env.verbose || env.trace)
-		name = task_name(name_buf, sizeof(name_buf), &e->task);
-	else
-		name = "???";
+	status = event_kind_str(e->kind);
 
 	if (env.trace) {
 		switch (e->kind) {
 		case EV_ON_CPU:
 			/* task finished running on CPU */
-			//emit_trace_slice_point(e, name, NULL, "ON_CPU", false /* !start */);
+			//emit_trace_slice_point(e, e.task.comm, NULL, "ON_CPU", false /* !start */);
 			break;
 		case EV_OFF_CPU:
 			/* task starting to run on CPU */
-			//emit_trace_slice_point(e, name, NULL, "ON_CPU", true /* start */);
+			//emit_trace_slice_point(e, e.task.comm, NULL, "ON_CPU", true /* start */);
 			break;
 		case EV_TIMER:
 			/* task keeps running on CPU */
 			emit_instant(e->ts, &e->task, "TIMER", NULL);
 			break;
 		case EV_SWITCH: {
-					/*
-			char pbuf[256], buf[256];
-			const char *pname;
+			const char *prev_name;
 
-			pname = task_name(pbuf, sizeof(pbuf), &e->swtch.prev_task);
-			snprintf(buf, sizeof(buf), "%d/%d(%s)->%d/%d(%s)",
-				 e->swtch.prev_task.tid, e->swtch.prev_task.pid, pname,
-				 e->task.tid, e->task.pid, name);
-				 */
-
-			emit_slice_point(e->ts, &e->swtch.prev_task,
-					 e->swtch.prev_task.comm, NULL, "ONCPU", false /*!start*/) {
+			/* take into account task rename for switched-out task
+			 * to maintain consistently named trace slice
+			 */
+			prev_name = pst->rename_ts ? pst->old_comm : e->swtch.prev.comm;
+			emit_slice_point(e->ts, &e->swtch.prev, prev_name, NULL, "ONCPU", false /*!start*/) {
 				emit_subobj_start("args");
 				emit_kv_fmt("switch_to", "%s(%d/%d)",
 					    e->task.comm, trace_tid(&e->task), e->task.pid);
+				if (pst->rename_ts)
+					emit_kv_str("renamed_to", e->swtch.prev.comm);
 			}
-		       /* !!!HACK to nest instant event at *EXACT* end of the slice within that slice,
-			* because slice's end is considered to be *EXCLUSIVE*!
-			* So, we adjust timestamp by one nanosecond BACKWARDS.
-			*/
-			//emit_instant(e->ts - 1, &e->swtch.prev_task, "SWITCH_OUT", buf);
 
-			emit_slice_point(e->ts, &e->task, name, NULL, "ONCPU", true /*start*/) {
+			emit_slice_point(e->ts, &e->task, e->task.comm, NULL, "ONCPU", true /*start*/) {
 				emit_subobj_start("args");
 				if (e->swtch.waking_ts) {
 					emit_kv_int("waking_cpu", e->swtch.waking_cpu);
 					emit_kv_float("waking_delay_us", "%.3lf", (e->ts - e->swtch.waking_ts) / 1000.0);
 					emit_kv_fmt("waking_from", "%s(%d/%d)",
-						    e->swtch.waking_task.comm,
-						    trace_tid(&e->swtch.waking_task), e->swtch.waking_task.pid);
+						    e->swtch.waking.comm,
+						    trace_tid(&e->swtch.waking), e->swtch.waking.pid);
+					emit_kv_str("waking_reason", waking_reason_str(e->swtch.waking_flags));
 				}
 				emit_kv_fmt("switch_from", "%s(%d/%d)",
-					    e->swtch.prev_task.comm,
-					    trace_tid(&e->swtch.prev_task), e->swtch.prev_task.pid);
+					    e->swtch.prev.comm,
+					    trace_tid(&e->swtch.prev), e->swtch.prev.pid);
 				emit_kv_int("cpu", e->cpu_id);
 			}
+
+			/*
+			sfmt("%d/%d(%s)->%d/%d(%s)",
+			      e->swtch.prev.tid, e->swtch.prev.pid, e->swtch.prev.comm,
+			      e->task.tid, e->task.pid, e->task.comm);
+			 */
+		       /* !!!HACK to nest instant event at *EXACT* end of the slice within that slice,
+			* because slice's end is considered to be *EXCLUSIVE*!
+			* So, we adjust timestamp by one nanosecond BACKWARDS.
+			*/
+			//emit_instant(e->ts - 1, &e->swtch.prev, "SWITCH_OUT", buf);
 			//emit_instant(e->ts, &e->task, "SWITCH_IN", buf);
+
+			pst->rename_ts = 0;
 			break;
 		}
+		case EV_FORK:
+			emit_instant(e->ts, &e->task, "FORKING", NULL) {
+				emit_subobj_start("args");
+				emit_kv_fmt("forked_into", "%s(%d/%d)",
+					    e->fork.child.comm, trace_tid(&e->fork.child), e->fork.child.pid);
+			}
+			emit_instant(e->ts, &e->fork.child, "FORKED", NULL) {
+				emit_subobj_start("args");
+				emit_kv_fmt("forked_from", "%s(%d/%d)",
+					    e->task.comm, trace_tid(&e->task), e->task.pid);
+			}
+			break;
+		case EV_EXEC:
+			emit_instant(e->ts, &e->task, "EXEC", NULL) {
+				emit_subobj_start("args");
+				emit_kv_str("filename", e->exec.filename);
+				if (e->task.tid != e->exec.old_tid)
+					emit_kv_int("tid_changed_from", e->exec.old_tid);
+			}
+			break;
+		case EV_TASK_RENAME:
+			emit_instant(e->ts, &e->task, "RENAME",
+				     sfmt("%s->%s", e->task.comm, e->rename.new_comm));
+			break;
+		case EV_TASK_EXIT:
+			emit_instant(e->ts, &e->task, "EXIT", e->task.comm);
+			break;
+		case EV_TASK_FREE:
+			emit_instant(e->ts, &e->task, "FREE", e->task.comm);
+			break;
 		case EV_WAKEUP:
-			emit_instant(e->ts, &e->task, "WAKEUP", name);
+			emit_instant(e->ts, &e->task, "WAKEUP", e->task.comm);
 			break;
 		case EV_WAKEUP_NEW:
-			emit_instant(e->ts, &e->task, "WAKEUP_NEW", name);
+			emit_instant(e->ts, &e->task, "WAKEUP_NEW", e->task.comm);
 			break;
 		case EV_WAKING:
-			emit_instant(e->ts, &e->task, "WAKING", name);
-			break;
-		case EV_EXIT:
-			emit_instant(e->ts, &e->task, "EXIT", name);
+			emit_instant(e->ts, &e->task, "WAKING", e->task.comm);
 			break;
 		case EV_HARDIRQ_ENTER:
 		case EV_HARDIRQ_EXIT:
@@ -738,7 +985,8 @@ static int handle_event(void *_ctx, void *data, size_t size)
 	if (!env.verbose)
 		return 0;
 
-	printf("%s (%d/%d) @ CPU %d %s %lldus\n", name, e->task.tid, e->task.pid, e->cpu_id,
+	printf("%s (%d/%d) @ CPU %d %s %lldus\n",
+	       e->task.comm, e->task.tid, e->task.pid, e->cpu_id,
 	       status, e->dur_ns / 1000);
 
 	/*
@@ -763,50 +1011,6 @@ static int handle_event(void *_ctx, void *data, size_t size)
 	*/
 
 	return 0;
-}
-
-static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
-{
-	if (level == LIBBPF_DEBUG && !env.libbpf_logs)
-		return 0;
-	return vfprintf(stderr, format, args);
-}
-
-static __u64 ktime_off;
-
-static inline uint64_t timespec_to_ns(struct timespec *ts)
-{
-	return ts->tv_sec * 1000000000ULL + ts->tv_nsec;
-}
-
-static void calibrate_ktime(void)
-{
-	int i;
-	struct timespec t1, t2, t3;
-	uint64_t best_delta = 0, delta, ts;
-
-	for (i = 0; i < 10; i++) {
-		clock_gettime(CLOCK_REALTIME, &t1);
-		clock_gettime(CLOCK_MONOTONIC, &t2);
-		clock_gettime(CLOCK_REALTIME, &t3);
-
-		delta = timespec_to_ns(&t3) - timespec_to_ns(&t1);
-		ts = (timespec_to_ns(&t3) + timespec_to_ns(&t1)) / 2;
-
-		if (i == 0 || delta < best_delta) {
-			best_delta = delta;
-			ktime_off = ts - timespec_to_ns(&t2);
-		}
-	}
-}
-
-static __u64 ktime_now_ns()
-{
-	struct timespec t;
-
-	clock_gettime(CLOCK_MONOTONIC, &t);
-
-	return timespec_to_ns(&t);
 }
 
 static void print_stats(struct wprof_bpf *skel, int num_cpus)
@@ -897,7 +1101,7 @@ int main(int argc, char **argv)
 
 	libbpf_set_print(libbpf_print_fn);
 
-	stats = hashmap__new(hash_identity_fn, hash_equal_fn, NULL);
+	tasks = hashmap__new(hash_identity_fn, hash_equal_fn, NULL);
 
 	err = parse_cpu_mask_file(online_cpus_file, &online_mask, &num_online_cpus);
 	if (err) {

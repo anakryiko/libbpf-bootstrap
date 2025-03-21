@@ -44,13 +44,17 @@ enum event_kind {
 	EV_WAKEUP_NEW,
 	EV_WAKEUP,
 	EV_WAKING,
-	EV_EXIT,
 	EV_HARDIRQ_ENTER,
 	EV_HARDIRQ_EXIT,
 	EV_SOFTIRQ_ENTER,
 	EV_SOFTIRQ_EXIT,
 	EV_WQ_START,
 	EV_WQ_END,
+	EV_FORK,
+	EV_EXEC,
+	EV_TASK_RENAME,
+	EV_TASK_EXIT,
+	EV_TASK_FREE,
 };
 
 typedef __u64 stack_trace_t[MAX_STACK_DEPTH];
@@ -63,6 +67,13 @@ struct wprof_task {
 	char pcomm[TASK_COMM_LEN];
 };
 
+enum waking_flags {
+	WF_UNKNOWN,
+	WF_AWOKEN,
+	WF_AWOKEN_NEW,
+	WF_PREEMPTED,
+};
+
 struct wprof_event {
 	enum event_kind kind;
 	__u32 cpu_id;
@@ -72,10 +83,11 @@ struct wprof_event {
 
 	union {
 		struct wprof_switch {
-			struct wprof_task prev_task;
-			struct wprof_task waking_task;
+			struct wprof_task prev;
+			struct wprof_task waking;
 			__u64 waking_ts;
 			__u32 waking_cpu;
+			enum waking_flags waking_flags;
 		} swtch;
 		struct wprof_timer {
 		} timer;
@@ -89,6 +101,16 @@ struct wprof_event {
 		struct wprof_wq_info {
 			char desc[WORKER_DESC_LEN];
 		} wq;
+		struct wprof_task_rename {
+			char new_comm[TASK_COMM_LEN];
+		} rename;
+		struct wprof_fork {
+			struct wprof_task child;
+		} fork;
+		struct wprof_exec {
+			int old_tid;
+			char filename[WORKER_DESC_LEN - 4];
+		} exec;
 	};
 
 	/*

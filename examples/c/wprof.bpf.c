@@ -9,11 +9,14 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+#define TASK_RUNNING 0
+
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 struct task_state {
 	__u64 ts;
 	__u64 waking_ts;
 	__u32 waking_cpu;
+	__u32 waking_flags;
 	struct wprof_task waking_task;
 	enum task_status status;
 };
@@ -133,7 +136,7 @@ static void fill_task_info(struct task_struct *t, struct wprof_task *info)
 {
 	info->tid = t->pid;
 	if (info->tid == 0) /* idle thread */
-		info->tid = -bpf_get_smp_processor_id();
+		info->tid = -(bpf_get_smp_processor_id() + 1);
 	info->pid = t->tgid;
 	info->flags = t->flags;
 	fill_task_name(t, info->comm, sizeof(info->comm));
@@ -217,7 +220,6 @@ int BPF_PROG(wprof_task_switch,
 	struct task_state *sprev, *snext;
 	struct wprof_event *e;
 	u64 now_ts, prev_dur_ns, next_dur_ns, waking_ts;
-	u32 waking_cpu;
 
 	if (!should_trace(prev, next))
 		return 0;
@@ -236,6 +238,16 @@ int BPF_PROG(wprof_task_switch,
 	sprev->ts = now_ts;
 	sprev->waking_ts = 0;
 
+	/* if process was involuntarily preempted, mark this as a start of
+	 * scheduling delay
+	 */
+	if (prev->__state == TASK_RUNNING && prev->pid) {
+		sprev->waking_ts = now_ts;
+		sprev->waking_cpu = bpf_get_smp_processor_id();
+		sprev->waking_flags = WF_PREEMPTED;
+		fill_task_info(next, &sprev->waking_task);
+	}
+
 	/* next task was off-cpu since last checkpoint */
 	next_dur_ns = now_ts - (snext->ts ?: session_start_ts);
 	snext->ts = now_ts;
@@ -252,11 +264,12 @@ int BPF_PROG(wprof_task_switch,
 	}
 
 	if ((e = prep_task_event(EV_SWITCH, now_ts, next))) {
-		fill_task_info(prev, &e->swtch.prev_task);
+		fill_task_info(prev, &e->swtch.prev);
 		e->swtch.waking_ts = waking_ts;
 		if (waking_ts) {
 			e->swtch.waking_cpu = snext->waking_cpu;
-			bpf_probe_read_kernel(&e->swtch.waking_task, sizeof(snext->waking_task),
+			e->swtch.waking_flags = snext->waking_flags;
+			bpf_probe_read_kernel(&e->swtch.waking, sizeof(snext->waking_task),
 					      &snext->waking_task);
 		}
 		submit_event(e);
@@ -283,14 +296,13 @@ int BPF_PROG(wprof_task_waking, struct task_struct *p)
 	now_ts = bpf_ktime_get_ns();
 	s->waking_ts = now_ts;
 	s->waking_cpu = bpf_get_smp_processor_id();
+	s->waking_flags = WF_AWOKEN;
 	task = bpf_get_current_task_btf();
 	fill_task_info(task, &s->waking_task);
 
-	/*
 	if ((e = prep_task_event(EV_WAKING, now_ts, p))) {
 		submit_event(e);
 	}
-	*/
 
 	return 0;
 }
@@ -298,6 +310,7 @@ int BPF_PROG(wprof_task_waking, struct task_struct *p)
 SEC("tp_btf/sched_wakeup_new")
 int BPF_PROG(wprof_task_wakeup_new, struct task_struct *p)
 {
+	struct task_struct *task;
 	struct task_state *s;
 	struct wprof_event *e;
 	u64 now_ts;
@@ -314,14 +327,15 @@ int BPF_PROG(wprof_task_wakeup_new, struct task_struct *p)
 	if (s->waking_ts == 0) {
 		s->waking_ts = now_ts;
 		s->waking_cpu = bpf_get_smp_processor_id();
+		s->waking_flags = WF_AWOKEN_NEW;
+		task = bpf_get_current_task_btf();
+		fill_task_info(task, &s->waking_task);
 	}
 	s->status = STATUS_OFF_CPU;
 
-	/*
 	if ((e = prep_task_event(EV_WAKEUP_NEW, now_ts, p))) {
 		submit_event(e);
 	}
-	*/
 
 	return 0;
 }
@@ -335,12 +349,70 @@ int BPF_PROG(wprof_task_wakeup, struct task_struct *p)
 	if (!should_trace(p, NULL))
 		return 0;
 
-	/*
 	now_ts = bpf_ktime_get_ns();
 	if ((e = prep_task_event(EV_WAKEUP, now_ts, p))) {
 		submit_event(e);
 	}
-	*/
+
+	return 0;
+}
+
+SEC("tp_btf/task_rename")
+int BPF_PROG(wprof_task_rename, struct task_struct *task, const char *comm)
+{
+	struct wprof_event *e;
+	u64 now_ts;
+
+	if (!should_trace(task, NULL))
+		return 0;
+
+	if (task->flags & (PF_KTHREAD | PF_WQ_WORKER))
+		return 0;
+
+	now_ts = bpf_ktime_get_ns();
+
+	if ((e = prep_task_event(EV_TASK_RENAME, now_ts, task))) {
+		bpf_probe_read_kernel_str(e->rename.new_comm, sizeof(e->rename.new_comm), comm);
+		submit_event(e);
+	}
+
+	return 0;
+}
+
+
+SEC("tp_btf/sched_process_fork")
+int BPF_PROG(wprof_task_fork, struct task_struct *parent, struct task_struct *child)
+{
+	struct wprof_event *e;
+	u64 now_ts;
+
+	if (!should_trace(parent, child))
+		return 0;
+
+	now_ts = bpf_ktime_get_ns();
+	if ((e = prep_task_event(EV_FORK, now_ts, parent))) {
+		fill_task_info(child, &e->fork.child);
+		submit_event(e);
+	}
+
+	return 0;
+}
+
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(wprof_task_exec, struct task_struct *p, int old_pid, struct linux_binprm *bprm)
+{
+	struct wprof_event *e;
+	u64 now_ts;
+
+	if (!should_trace(p, NULL))
+		return 0;
+
+	now_ts = bpf_ktime_get_ns();
+	if ((e = prep_task_event(EV_EXEC, now_ts, p))) {
+		e->exec.old_tid = old_pid;
+		bpf_probe_read_kernel_str(e->exec.filename, sizeof(e->exec.filename), bprm->filename);
+		submit_event(e);
+	}
 
 	return 0;
 }
@@ -371,7 +443,25 @@ int BPF_PROG(wprof_task_exit, struct task_struct *p)
 		submit_event(e);
 	}
 
-	if ((e = prep_task_event(EV_EXIT, now_ts, p))) {
+	if ((e = prep_task_event(EV_TASK_EXIT, now_ts, p))) {
+		submit_event(e);
+	}
+
+	return 0;
+}
+
+SEC("tp_btf/sched_process_free")
+int BPF_PROG(wprof_task_free, struct task_struct *p)
+{
+	struct task_state *s;
+	struct wprof_event *e;
+	u64 now_ts;
+
+	if (!should_trace(p, NULL))
+		return 0;
+
+	now_ts = bpf_ktime_get_ns();
+	if ((e = prep_task_event(EV_TASK_FREE, now_ts, p))) {
 		submit_event(e);
 	}
 
@@ -427,7 +517,6 @@ static int handle_softirq(struct task_struct *task, int vec_nr, bool start)
 
 	return 0;
 }
-
 
 SEC("tp_btf/softirq_entry")
 int BPF_PROG(wprof_softirq_entry, int vec_nr)
