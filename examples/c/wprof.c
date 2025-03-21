@@ -12,6 +12,7 @@
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <linux/perf_event.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -1124,52 +1125,94 @@ static int handle_event(void *_ctx, void *data, size_t size)
 	return 0;
 }
 
-static void print_stats(struct wprof_bpf *skel, int num_cpus)
+static void print_exit_summary(struct wprof_bpf *skel, int num_cpus, int exit_code)
 {
-	struct wprof_stats *stats = calloc(num_cpus, sizeof(*stats));
-	struct wprof_stats s = {};
-	int zero = 0, err, i;
+	int err;
+
+	if (!skel)
+		goto skip_prog_stats;
+
 	struct bpf_program *prog;
 
+	fprintf(stderr, "BPF program runtime stats:\n");
 	bpf_object__for_each_program(prog, skel->obj) {
 		struct bpf_prog_info info;
 		__u32 info_sz = sizeof(info);
 
+		if (bpf_program__fd(prog) < 0) /* optional inactive program */
+			continue;
+
 		memset(&info, 0, sizeof(info));
 		err = bpf_prog_get_info_by_fd(bpf_program__fd(prog), &info, &info_sz);
 		if (err) {
-			fprintf(stderr, "%s: failed to fetch prog info: %d\n",
+			fprintf(stderr, "!!! %s: failed to fetch prog info: %d\n",
 				bpf_program__name(prog), err);
 			continue;
 		}
 
 		if (info.recursion_misses) {
-			fprintf(stderr, "%s: missed %llu execution misses!\n",
+			fprintf(stderr, "!!! %s: %llu execution misses!\n",
 				bpf_program__name(prog), info.recursion_misses);
 		}
 
 		if (env.bpf_stats) {
-			fprintf(stderr, "%s: %llu runs for total of %.3lfms.\n",
+			fprintf(stderr, "\t%s: %llu runs for total of %.3lfms.\n",
 				bpf_program__name(prog), info.run_cnt, info.run_time_ns / 1000000.0);
 		}
 	}
 
+skip_prog_stats:
+	struct rusage ru;
+
+	if (getrusage(RUSAGE_SELF, &ru)) {
+		fprintf(stderr, "Failed to get wprof's resource usage data!..\n");
+		goto skip_rusage;
+	}
+
+	fprintf(stderr, "wprof's own resource usage:\n");
+	fprintf(stderr, "\tCPU time (user/system, s):\t\t%.3lf/%.3lf\n",
+		ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1000000.0,
+		ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1000000.0);
+	fprintf(stderr, "\tMemory (max RSS, MB):\t\t\t%.3lf\n",
+		ru.ru_maxrss / 1024.0);
+	fprintf(stderr, "\tPage faults (maj/min, M)\t\t%.3lf/%.3lf\n",
+		ru.ru_majflt / 1000000.0, ru.ru_minflt / 1000000.0);
+	fprintf(stderr, "\tBlock I/Os (K):\t\t\t\t%.3lf/%.3lf\n",
+		ru.ru_inblock / 1000.0, ru.ru_oublock / 1000.0);
+	fprintf(stderr, "\tContext switches (vol/invol, M):\t%.3lf/%.3lf\n",
+		ru.ru_nvcsw / 1000000.0, ru.ru_nivcsw / 1000000.0);
+
+skip_rusage:
+	struct wprof_stats *stats;
+	struct wprof_stats s = {};
+	int zero = 0;
+
+	if (!skel)
+		goto skip_drop_stats;
+
+	stats = calloc(num_cpus, sizeof(*stats));
 	err = bpf_map__lookup_elem(skel->maps.stats, &zero, sizeof(int),
 				   stats, sizeof(*stats) * num_cpus, 0);
 	if (err) {
 		fprintf(stderr, "Failed to fetch BPF-side stats: %d\n", err);
-		return;
+		goto skip_drop_stats;
 	}
 
-	for (i = 0; i < num_cpus; i++) {
+	for (int i = 0; i < num_cpus; i++) {
 		s.rb_drops += stats[i].rb_drops;
 		s.task_state_drops += stats[i].task_state_drops;
 	}
+	free(stats);
 
 	if (s.rb_drops)
-		fprintf(stderr, "Total ringbuf drops: %llu\n", s.rb_drops);
+		fprintf(stderr, "!!! Ringbuf drops: %llu\n", s.rb_drops);
 	if (s.task_state_drops)
-		fprintf(stderr, "Total task state drops: %llu\n", s.task_state_drops);
+		fprintf(stderr, "!!! Task state drops: %llu\n", s.task_state_drops);
+
+skip_drop_stats:
+	fprintf(stderr, "Exited %s (after %.3lfs).\n",
+		exit_code ? "with errors" : "cleanly",
+		(ktime_now_ns() - env.sess_start_ts) / 1000000000.0);
 }
 
 static ssize_t file_size(FILE *f)
@@ -1429,11 +1472,7 @@ cleanup:
 		fclose(env.trace);
 	}
 
-	if (skel) {
-		print_stats(skel, num_cpus);
-		fprintf(stderr, "Exited cleanly (after %.3lfs).\n",
-			(ktime_now_ns() - env.sess_start_ts) / 1000000000.0);
-	}
+	print_exit_summary(skel, num_cpus, err);
 
 	ring_buffer__free(ring_buf);
 	wprof_bpf__destroy(skel);
