@@ -238,26 +238,29 @@ static const char *sfmt(const char *fmt, ...)
 	return fmt_buf;
 }
 
-struct emit_state {
-	int level;
-	int fcnts[5]; /* field counts on each level of nestedness */
-	bool in_arrs[5]; /* whether we are inside the array, per-level */
-	int acnts[5]; /* array element counts, per-level */ 
+enum emit_scope {
+	EMIT_ARR,
+	EMIT_OBJ,
 };
 
-static __thread struct emit_state em;
+struct emit_state {
+	int lvl;
+	enum emit_scope scope[5];
+	int cnt[5]; /* object field or array items counts, per-level */
+};
+
+static __thread struct emit_state em = {.lvl = -1};
 
 static void emit_obj_start(void)
 {
-	em.level++;
+	em.scope[++em.lvl] = EMIT_OBJ;
 	fprintf(env.trace, "{");
 }
 
 static void emit_obj_end(void)
 {
-	em.fcnts[em.level] = 0;
-	em.level--;
-	if (em.level == 0)
+	em.cnt[em.lvl--] = 0;
+	if (em.lvl < 0) /* outermost level, we are done with current record */
 		fprintf(env.trace, "},\n");
 	else
 		fprintf(env.trace, "}");
@@ -265,8 +268,8 @@ static void emit_obj_end(void)
 
 static void emit_key(const char *key)
 {
-	fprintf(env.trace, "%s\"%s\":", em.fcnts[em.level] ? "," : "", key);
-	em.fcnts[em.level]++;
+	fprintf(env.trace, "%s\"%s\":", em.cnt[em.lvl] ? "," : "", key);
+	em.cnt[em.lvl]++;
 }
 
 static void emit_subobj_start(const char *key)
@@ -310,30 +313,49 @@ static void emit_kv_float(const char *key, const char *fmt, double value)
 {
 	emit_key(key);
 	fprintf(env.trace, fmt, value);
-	em.fcnts[em.level]++;
+	em.cnt[em.lvl]++;
 }
 
-/*
+__unused
 static void emit_arr_start(void)
 {
+	em.scope[++em.lvl] = EMIT_ARR;
 	fprintf(env.trace, "[");
 }
 
+__unused
 static void emit_arr_end(void)
 {
+	em.cnt[em.lvl--] = 0;
 	fprintf(env.trace, "]");
+}
+
+__unused
+static void emit_subarr_start(const char *key)
+{
+	emit_key(key);
+	emit_arr_start();
+}
+
+static void emit_arr_elem(void)
+{
+	if (em.cnt[em.lvl])
+		fprintf(env.trace, ",");
+	em.cnt[em.lvl]++;
 }
 
 __unused
 static void emit_arr_str(const char *value)
 {
+	emit_arr_elem();
+	fprintf(env.trace, "\"%s\"", value);
 }
 
 __unused
-__attribute__((format(printf, 2, 3)))
-static void emit_kv_fmt(const char *key, const char *fmt, ...)
+__attribute__((format(printf, 1, 2)))
+static void emit_arr_fmt(const char *fmt, ...)
 {
-	emit_key(key);
+	emit_arr_elem();
 
 	fprintf(env.trace, "\"");
 
@@ -346,27 +368,29 @@ static void emit_kv_fmt(const char *key, const char *fmt, ...)
 }
 
 __unused
-static void emit_kv_int(const char *key, long long value)
+static void emit_arr_int(long long value)
 {
-	emit_key(key);
+	emit_arr_elem();
 	fprintf(env.trace, "%lld", value);
 }
 
 __unused
-static void emit_kv_float(const char *key, const char *fmt, double value)
+static void emit_arr_float(const char *fmt, double value)
 {
-	emit_key(key);
+	emit_arr_elem();
 	fprintf(env.trace, fmt, value);
-	em.fcnts[em.level]++;
 }
-*/
 
 struct emit_rec { bool done; };
 
 static void emit_cleanup(struct emit_rec *r)
 {
-	while (em.level)
-		emit_obj_end();
+	while (em.lvl >= 0) {
+		if (em.scope[em.lvl] == EMIT_OBJ)
+			emit_obj_end();
+		else
+			emit_arr_end();
+	}
 }
 
 static struct blaze_symbolizer *symbolizer;
@@ -740,6 +764,26 @@ static struct emit_rec emit_slice_point_pre(__u64 ts, const struct wprof_task *t
 	     emit_slice_point_pre(ts, t, name, subname, category, start);			\
 	     !___r.done; ___r.done = true)
 
+__unused
+static struct emit_rec emit_counter_pre(__u64 ts, const struct wprof_task *t,
+					const char *name, const char *subname)
+{
+	emit_obj_start();
+		emit_kv_str("ph", "C");
+		emit_kv_float("ts", "%.3lf", (ts - env.sess_start_ts) / 1000.0);
+		/* counters are process-scoped, so include TID into counter name */
+		emit_kv_fmt("name", "%s%s%s:%d", name, subname ? ":" : "", subname ?: "", trace_tid(t));
+		//emit_kv_int("tid", trace_tid(t));
+		emit_kv_int("pid", trace_pid(t));
+		emit_subobj_start("args");
+	return (struct emit_rec){};
+}
+
+#define emit_counter(ts, t, name, subname)							\
+	for (struct emit_rec ___r __cleanup(emit_cleanup) =					\
+	     emit_counter_pre(ts, t, name, subname);						\
+	     !___r.done; ___r.done = true)
+
 static int emit_trace_meta(const struct wprof_task *t)
 {
 	int tid = trace_tid(t);
@@ -874,7 +918,8 @@ static int handle_event(void *_ctx, void *data, size_t size)
 			break;
 		case EV_TIMER:
 			/* task keeps running on CPU */
-			emit_instant(e->ts, &e->task, "TIMER", NULL);
+			emit_instant(e->ts, &e->task, "TIMER", NULL) {
+			}
 			break;
 		case EV_SWITCH: {
 			const char *prev_name;
@@ -905,6 +950,20 @@ static int handle_event(void *_ctx, void *data, size_t size)
 					    e->swtch.prev.comm,
 					    trace_tid(&e->swtch.prev), e->swtch.prev.pid);
 				emit_kv_int("cpu", e->cpu_id);
+				emit_obj_end();
+
+				/*
+				emit_subarr_start("stack");
+				emit_arr_str("blah");
+				emit_arr_fmt("WOOT%d", 123);
+				emit_arr_end();
+				*/
+			}
+
+			if (e->swtch.waking_ts) {
+				emit_counter(e->ts, &e->task, "waking_delay", NULL) {
+					emit_kv_float("us", "%.3lf", (e->ts - e->swtch.waking_ts) / 1000.0);
+				}
 			}
 
 			/*
