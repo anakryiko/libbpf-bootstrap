@@ -11,6 +11,7 @@
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <linux/perf_event.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -36,6 +37,7 @@ static struct env {
 	bool bpf_stats;
 	bool libbpf_logs;
 	bool print_stats;
+	bool cpu_counters;
 	int freq;
 	int stats_period_ms; 
 	int run_dur_ms;
@@ -69,6 +71,7 @@ enum {
 	OPT_LIBBPF_LOGS = 1004,
 	OPT_RUN_DUR_MS = 1005,
 	OPT_PRINT_STATS = 1006,
+	OPT_CPU_COUNTERS = 1007,
 };
 
 static const struct argp_option opts[] = {
@@ -86,6 +89,7 @@ static const struct argp_option opts[] = {
 	{ "ringbuf-size", OPT_RINGBUF_SZ, "SIZE", 0, "BPF ringbuf size (in KBs)" },
 	{ "task-state-size", OPT_TASK_STATE_SZ, "SIZE", 0, "BPF task state map size (in threads)" },
 
+	{ "cpu-counters", OPT_CPU_COUNTERS, NULL, 0, "Capture and emit CPU cycles counters" },
 	{ "print-stats", OPT_PRINT_STATS, NULL, 0, "Print stats periodically" },
 	{ "stats-period", OPT_STATS_PERIOD, "PERIOD", 0, "Stats printing period (in ms)" },
 	{ "run-dur-ms", OPT_RUN_DUR_MS, "DURATION", 0, "Limit running duration to given number of ms" },
@@ -154,6 +158,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case OPT_PRINT_STATS:
 		env.print_stats = true;
+		break;
+	case OPT_CPU_COUNTERS:
+		env.cpu_counters = true;
 		break;
 	case OPT_STATS_PERIOD:
 		errno = 0;
@@ -524,6 +531,9 @@ struct task_state {
 	/* periodic stats */
 	uint64_t on_cpu_ns;
 	uint64_t off_cpu_ns;
+	/* perf counters */
+	__u64 oncpu_ts;
+	__u64 cpu_cycles;
 };
 
 static struct hashmap *tasks;
@@ -830,6 +840,22 @@ static int emit_trace_meta(const struct wprof_task *t)
 	return 0;
 }
 
+static void emit_thread_meta(const struct wprof_task *t, const char *name)
+{
+	int tid = trace_tid(t);
+	int pid = trace_pid(t);
+	
+	emit_obj_start();
+		emit_kv_str("ph", "M");
+		emit_kv_str("name", "thread_name");
+		emit_kv_int("tid", tid);
+		emit_kv_int("pid", pid);
+		emit_key("args"); emit_obj_start();
+			emit_kv_str("name", name);
+		emit_obj_end();
+	emit_obj_end();
+}
+
 static struct task_state *task_state(struct wprof_task *t)
 {
 	unsigned long key = task_id(t);
@@ -882,6 +908,8 @@ static int handle_event(void *_ctx, void *data, size_t size)
 	case EV_SWITCH:
 		/* init switched-from task state, if necessary */
 		pst = task_state(&e->swtch.prev);
+		st->cpu_cycles = e->swtch.cpu_cycles;
+		st->oncpu_ts = e->ts;
 		break;
 	case EV_FORK:
 		/* init forked child task state */
@@ -932,6 +960,10 @@ static int handle_event(void *_ctx, void *data, size_t size)
 				emit_subobj_start("args");
 				emit_kv_fmt("switch_to", "%s(%d/%d)",
 					    e->task.comm, trace_tid(&e->task), e->task.pid);
+				if (env.cpu_counters && pst->cpu_cycles && e->swtch.cpu_cycles) {
+					emit_kv_float("cpu_mega_cycles", "%.6lf",
+						      (e->swtch.cpu_cycles - pst->cpu_cycles) / 1000000.0);
+				}
 				if (pst->rename_ts)
 					emit_kv_str("renamed_to", e->swtch.prev.comm);
 			}
@@ -960,6 +992,15 @@ static int handle_event(void *_ctx, void *data, size_t size)
 				*/
 			}
 
+			if (env.cpu_counters && pst->oncpu_ts && pst->cpu_cycles && e->swtch.cpu_cycles) {
+				emit_counter(pst->oncpu_ts, &e->swtch.prev, "cpu_cycles", NULL) {
+					emit_kv_float("mega_cycles", "%.6lf",
+						      (e->swtch.cpu_cycles - pst->cpu_cycles) / 1000000.0);
+				}
+				emit_counter(e->ts, &e->swtch.prev, "cpu_cycles", NULL) {
+					emit_kv_float("mega_cycles", "%.6lf", 0.0);
+				}
+			}
 			if (e->swtch.waking_ts) {
 				emit_counter(e->ts, &e->task, "waking_delay", NULL) {
 					emit_kv_float("us", "%.3lf", (e->ts - e->swtch.waking_ts) / 1000.0);
@@ -1004,6 +1045,7 @@ static int handle_event(void *_ctx, void *data, size_t size)
 		case EV_TASK_RENAME:
 			emit_instant(e->ts, &e->task, "RENAME",
 				     sfmt("%s->%s", e->task.comm, e->rename.new_comm));
+			emit_thread_meta(&e->task, e->rename.new_comm);
 			break;
 		case EV_TASK_EXIT:
 			emit_instant(e->ts, &e->task, "EXIT", e->task.comm);
@@ -1039,6 +1081,16 @@ static int handle_event(void *_ctx, void *data, size_t size)
 		default:
 			break;
 		}
+	}
+
+	/* event post-processing logic */
+	switch (e->kind) {
+	case EV_SWITCH:
+		/* init switched-from task state, if necessary */
+		pst->cpu_cycles = 0;
+		pst->oncpu_ts = 0;
+		break;
+	default:
 	}
 
 	if (!env.verbose)
@@ -1139,7 +1191,7 @@ int main(int argc, char **argv)
 	struct bpf_link **links = NULL;
 	struct ring_buffer *ring_buf = NULL;
 	int num_cpus, num_online_cpus;
-	int *pefds = NULL, pefd;
+	int *perf_timer_fds = NULL, *perf_counter_fds = NULL, pefd;
 	int i, err = 0;
 	bool *online_mask = NULL;
 	struct itimerval timer_ival;
@@ -1186,10 +1238,12 @@ int main(int argc, char **argv)
 
 	bpf_map__set_max_entries(skel->maps.rb, env.ringbuf_sz);
 	bpf_map__set_max_entries(skel->maps.task_states, env.task_state_sz);
+	bpf_map__set_max_entries(skel->maps.perf_cntrs, num_cpus);
 	if (env.cpu >= 0) {
 		skel->rodata->cpu_filter = true;
 		skel->data_cpus->cpus[env.cpu / 64] |= (1ULL << ((env.cpu) % 64));
 	}
+	skel->rodata->cpu_counters = env.cpu_counters;
 
 	if (env.bpf_stats) {
 		stats_fd = bpf_enable_stats(BPF_STATS_RUN_TIME);
@@ -1217,36 +1271,68 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	pefds = malloc(num_cpus * sizeof(int));
+	perf_timer_fds = malloc(num_cpus * sizeof(int));
+	perf_counter_fds = malloc(num_cpus * sizeof(int));
 	for (i = 0; i < num_cpus; i++) {
-		pefds[i] = -1;
+		perf_timer_fds[i] = -1;
+		perf_counter_fds[i] = -1;
 	}
 
 	links = calloc(num_cpus, sizeof(struct bpf_link *));
 
-	memset(&attr, 0, sizeof(attr));
-	attr.size = sizeof(attr);
-	attr.type = PERF_TYPE_SOFTWARE;
-	attr.config = PERF_COUNT_SW_CPU_CLOCK;
-	attr.sample_freq = env.freq;
-	attr.freq = 1;
 
 	for (int cpu = 0; cpu < num_cpus; cpu++) {
 		/* skip offline/not present CPUs */
 		if (cpu >= num_online_cpus || !online_mask[cpu])
 			continue;
 
-		/* Set up performance monitoring on a CPU/Core */
+		/* timer perf event */
+		memset(&attr, 0, sizeof(attr));
+		attr.size = sizeof(attr);
+		attr.type = PERF_TYPE_SOFTWARE;
+		attr.config = PERF_COUNT_SW_CPU_CLOCK;
+		attr.sample_freq = env.freq;
+		attr.freq = 1;
+
 		pefd = perf_event_open(&attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
 		if (pefd < 0) {
 			fprintf(stderr, "Fail to set up performance monitor on a CPU/Core\n");
 			err = -1;
 			goto cleanup;
 		}
-		pefds[cpu] = pefd;
+		perf_timer_fds[cpu] = pefd;
 
-		/* Attach a BPF program on a CPU */
-		links[cpu] = bpf_program__attach_perf_event(skel->progs.wprof_timer_tick, pefd);
+		/* CPU cycles perf event, if supported */
+		memset(&attr, 0, sizeof(attr));
+		attr.size = sizeof(attr);
+		attr.type = PERF_TYPE_HARDWARE;
+		attr.config = PERF_COUNT_HW_CPU_CYCLES;
+
+		pefd = perf_event_open(&attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+		if (pefd < 0) {
+			fprintf(stderr, "Failed to create CPU cycles PMU for CPU #%d, skipping...\n", cpu);
+		} else {
+			perf_counter_fds[cpu] = pefd;
+			err = bpf_map__update_elem(skel->maps.perf_cntrs,
+						   &cpu, sizeof(cpu),
+						   &pefd, sizeof(pefd), 0);
+			if (err) {
+				fprintf(stderr, "Failed to set up cpu-cycles PMU on CPU#%d for BPF: %d\n", cpu, err);
+				goto cleanup;
+			}
+			err = ioctl(pefd, PERF_EVENT_IOC_ENABLE, 0);
+			if (err) {
+				fprintf(stderr, "Failed to enable cpu-cycles PMU on CPU#%d: %d\n", cpu, err);
+				goto cleanup;
+			}
+		}
+	}
+
+	for (int cpu = 0; cpu < num_cpus; cpu++) {
+		if (perf_timer_fds[cpu] < 0)
+			continue;
+
+		links[cpu] = bpf_program__attach_perf_event(skel->progs.wprof_timer_tick, perf_timer_fds[cpu]);
 		if (!links[cpu]) {
 			err = -1;
 			goto cleanup;
@@ -1311,12 +1397,17 @@ cleanup:
 			bpf_link__destroy(links[cpu]);
 		free(links);
 	}
-	if (pefds) {
+	if (perf_timer_fds || perf_counter_fds) {
 		for (i = 0; i < num_cpus; i++) {
-			if (pefds[i] >= 0)
-				close(pefds[i]);
+			if (perf_timer_fds[i] >= 0)
+				close(perf_timer_fds[i]);
+			if (perf_counter_fds[i] >= 0) {
+				(void)ioctl(perf_counter_fds[i], PERF_EVENT_IOC_DISABLE, 0);
+				close(perf_counter_fds[i]);
+			}
 		}
-		free(pefds);
+		free(perf_timer_fds);
+		free(perf_counter_fds);
 	}
 
 	if (ring_buf) /* drain ringbuf */

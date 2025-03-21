@@ -88,6 +88,7 @@ struct wprof_event {
 			__u64 waking_ts;
 			__u32 waking_cpu;
 			enum waking_flags waking_flags;
+			__u64 cpu_cycles;
 		} swtch;
 		struct wprof_timer {
 		} timer;

@@ -19,6 +19,7 @@ struct task_state {
 	__u32 waking_flags;
 	struct wprof_task waking_task;
 	enum task_status status;
+	__u64 cpu_cycles;
 };
 
 struct {
@@ -40,6 +41,12 @@ struct {
 })
 
 struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__type(key, int);
+	__type(value, int);
+} perf_cntrs SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 } rb SEC(".maps");
 
@@ -51,6 +58,8 @@ char comms[16][1] SEC(".data.comms");
 
 const volatile bool cpu_filter;
 __u64 cpus[512] SEC(".data.cpus"); /* CPU bitmask, up to 4096 CPUs are supported */
+
+const volatile bool cpu_counters;
 
 __u64 session_start_ts;
 
@@ -173,7 +182,13 @@ static struct wprof_event *prep_task_event(enum event_kind kind, u64 now_ts, str
 
 static void submit_event(struct wprof_event *e)
 {
-	bpf_ringbuf_submit(e, 0);
+	long queued_size = bpf_ringbuf_query(&rb, BPF_RB_AVAIL_DATA);
+	long flags = BPF_RB_NO_WAKEUP;
+
+	if (queued_size >= 256 * 1024)
+		flags = BPF_RB_FORCE_WAKEUP;
+
+	bpf_ringbuf_submit(e, flags);
 }
 
 SEC("perf_event")
@@ -219,7 +234,7 @@ int BPF_PROG(wprof_task_switch,
 {
 	struct task_state *sprev, *snext;
 	struct wprof_event *e;
-	u64 now_ts, prev_dur_ns, next_dur_ns, waking_ts;
+	u64 now_ts, prev_dur_ns, next_dur_ns, waking_ts, cpu_cycles = 0;
 
 	if (!should_trace(prev, next))
 		return 0;
@@ -232,6 +247,18 @@ int BPF_PROG(wprof_task_switch,
 	now_ts = bpf_ktime_get_ns();
 
 	waking_ts = snext->waking_ts;
+
+	if (cpu_counters) {
+		struct bpf_perf_event_value perf_val;
+		int err;
+
+		err = bpf_perf_event_read_value(&perf_cntrs, BPF_F_CURRENT_CPU, &perf_val, sizeof(perf_val));
+		if (err) {
+			bpf_printk("Failed to read perf counter: %d", err);
+		} else {
+			cpu_cycles = perf_val.counter;
+		}
+	}
 
 	/* prev task was on-cpu since last checkpoint */
 	prev_dur_ns = now_ts - (sprev->ts ?: session_start_ts);
@@ -264,6 +291,8 @@ int BPF_PROG(wprof_task_switch,
 	}
 
 	if ((e = prep_task_event(EV_SWITCH, now_ts, next))) {
+		e->swtch.cpu_cycles = cpu_cycles;
+
 		fill_task_info(prev, &e->swtch.prev);
 		e->swtch.waking_ts = waking_ts;
 		if (waking_ts) {
