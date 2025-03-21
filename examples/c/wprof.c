@@ -1094,6 +1094,9 @@ static int handle_event(void *_ctx, void *data, size_t size)
 	default:
 	}
 
+	if (exiting)
+		return -1;
+
 	if (!env.verbose)
 		return 0;
 
@@ -1415,7 +1418,7 @@ int main(int argc, char **argv)
 
 	timer_ival.it_value.tv_sec = (env.print_stats ? env.stats_period_ms : env.run_dur_ms) / 1000;
 	timer_ival.it_value.tv_usec = (env.print_stats ? env.stats_period_ms : env.run_dur_ms) * 1000 % 1000000;
-	timer_ival.it_interval = timer_ival.it_value;
+	timer_ival.it_interval = env.print_stats ? timer_ival.it_value : (struct timeval){};
 	err = setitimer(ITIMER_REAL, &timer_ival, NULL);
 	if (err < 0) {
 		fprintf(stderr, "Failed to setup stats timer: %d\n", err);
@@ -1428,9 +1431,13 @@ int main(int argc, char **argv)
 
 	/* Wait and receive stack traces */
 	while ((err = ring_buffer__poll(ring_buf, -1)) >= 0 || err == -EINTR) {
-		if (exiting)
+		if (exiting) {
+			err = 0;
 			break;
+		}
 	}
+
+	fprintf(stderr, "Stopping...\n");
 
 cleanup:
 	if (skel)
@@ -1453,6 +1460,7 @@ cleanup:
 		free(perf_counter_fds);
 	}
 
+	fprintf(stderr, "Draining...\n");
 	if (ring_buf) /* drain ringbuf */
 		(void)ring_buffer__consume(ring_buf);
 
