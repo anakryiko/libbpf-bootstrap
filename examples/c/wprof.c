@@ -1229,6 +1229,21 @@ static ssize_t file_size(FILE *f)
 	return st.st_size;
 }
 
+struct timer_plan {
+	int cpu;
+	__u64 delay_ns;
+};
+
+static int timer_plan_cmp(const void *a, const void *b)
+{
+	const struct timer_plan *x = a, *y = b;
+
+	if (x->delay_ns != y->delay_ns)
+		return x->delay_ns < y->delay_ns ? -1 : 1;
+
+	return x->cpu - y->cpu;
+}
+
 int main(int argc, char **argv)
 {
 	const char *online_cpus_file = "/sys/devices/system/cpu/online";
@@ -1324,10 +1339,21 @@ int main(int argc, char **argv)
 		perf_counter_fds[i] = -1;
 	}
 
-	links = calloc(num_cpus, sizeof(struct bpf_link *));
-
+	/* determine randomized spread-out "plan" for attaching to timers to
+	 * avoid too aligned (in time) triggerings across all CPUs
+	 */
+	__u64 timer_start_ts = ktime_now_ns();
+	struct timer_plan *timer_plan = calloc(num_cpus, sizeof(*timer_plan));
 
 	for (int cpu = 0; cpu < num_cpus; cpu++) {
+		timer_plan[cpu].cpu = cpu;
+		timer_plan[cpu].delay_ns = 1000000000ULL / env.freq * ((double)rand() / RAND_MAX);
+	}
+	qsort(timer_plan, num_cpus, sizeof(*timer_plan), timer_plan_cmp);
+
+	for (int i = 0; i < num_cpus; i++) {
+		int cpu = timer_plan[i].cpu;
+
 		/* skip offline/not present CPUs */
 		if (cpu >= num_online_cpus || !online_mask[cpu])
 			continue;
@@ -1339,6 +1365,10 @@ int main(int argc, char **argv)
 		attr.config = PERF_COUNT_SW_CPU_CLOCK;
 		attr.sample_freq = env.freq;
 		attr.freq = 1;
+
+		__u64 now = ktime_now_ns();
+		if (now < timer_start_ts + timer_plan[i].delay_ns)
+			usleep((timer_start_ts + timer_plan[i].delay_ns - now) / 1000);
 
 		pefd = perf_event_open(&attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
 		if (pefd < 0) {
@@ -1374,6 +1404,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+	links = calloc(num_cpus, sizeof(struct bpf_link *));
 	for (int cpu = 0; cpu < num_cpus; cpu++) {
 		if (perf_timer_fds[cpu] < 0)
 			continue;
