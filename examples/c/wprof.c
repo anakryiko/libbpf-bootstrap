@@ -39,6 +39,7 @@ static struct env {
 	bool libbpf_logs;
 	bool print_stats;
 	bool cpu_counters;
+	bool breakout_counters;
 	int freq;
 	int stats_period_ms; 
 	int run_dur_ms;
@@ -73,6 +74,7 @@ enum {
 	OPT_RUN_DUR_MS = 1005,
 	OPT_PRINT_STATS = 1006,
 	OPT_CPU_COUNTERS = 1007,
+	OPT_BREAKOUT_COUNTERS = 1008,
 };
 
 static const struct argp_option opts[] = {
@@ -91,6 +93,8 @@ static const struct argp_option opts[] = {
 	{ "task-state-size", OPT_TASK_STATE_SZ, "SIZE", 0, "BPF task state map size (in threads)" },
 
 	{ "cpu-counters", OPT_CPU_COUNTERS, NULL, 0, "Capture and emit CPU cycles counters" },
+	{ "breakout-counters", OPT_BREAKOUT_COUNTERS, NULL, 0, "Emit separate track for counters" },
+
 	{ "print-stats", OPT_PRINT_STATS, NULL, 0, "Print stats periodically" },
 	{ "stats-period", OPT_STATS_PERIOD, "PERIOD", 0, "Stats printing period (in ms)" },
 	{ "run-dur-ms", OPT_RUN_DUR_MS, "DURATION", 0, "Limit running duration to given number of ms" },
@@ -162,6 +166,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case OPT_CPU_COUNTERS:
 		env.cpu_counters = true;
+		break;
+	case OPT_BREAKOUT_COUNTERS:
+		env.breakout_counters = true;
 		break;
 	case OPT_STATS_PERIOD:
 		errno = 0;
@@ -993,7 +1000,8 @@ static int handle_event(void *_ctx, void *data, size_t size)
 				*/
 			}
 
-			if (env.cpu_counters && pst->oncpu_ts && pst->cpu_cycles && e->swtch.cpu_cycles) {
+			if (env.cpu_counters && env.breakout_counters &&
+			    pst->oncpu_ts && pst->cpu_cycles && e->swtch.cpu_cycles) {
 				emit_counter(pst->oncpu_ts, &e->swtch.prev, "cpu_cycles", NULL) {
 					emit_kv_float("mega_cycles", "%.6lf",
 						      (e->swtch.cpu_cycles - pst->cpu_cycles) / 1000000.0);
@@ -1002,7 +1010,7 @@ static int handle_event(void *_ctx, void *data, size_t size)
 					emit_kv_float("mega_cycles", "%.6lf", 0.0);
 				}
 			}
-			if (e->swtch.waking_ts) {
+			if (env.breakout_counters && e->swtch.waking_ts) {
 				emit_counter(e->ts, &e->task, "waking_delay", NULL) {
 					emit_kv_float("us", "%.3lf", (e->ts - e->swtch.waking_ts) / 1000.0);
 				}
