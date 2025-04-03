@@ -131,6 +131,8 @@ $(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@
 
+wprof: $(OUTPUT)/pb_common.o $(OUTPUT)/pb_encode.o $(OUTPUT)/perfetto_trace.pb.o
+
 # delete failed targets
 .DELETE_ON_ERROR:
 

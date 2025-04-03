@@ -1,0 +1,16 @@
+Perfetto repo: https://github.com/google/perfetto.git
+nanopb repo: https://github.com/nanopb/nanopb.git
+
+To generate perfetto_trace.pb.[ch] (combined .proto):
+
+```
+$ python3 ~/nanopb/generator/nanopb_generator.py --output-dir=$(realpath ~/perfetto) --strip-path --generated-include-format=quote --library-include-format=quote protos/perfetto/trace/perfetto_trace.proto
+$ cp protos/perfetto/trace/perfetto_trace.pb.[ch] .
+```
+
+Copy over nanopb encoder:
+```
+$ cp ~/nanopb/pb_{common,encode}.[ch] .
+```
+
+

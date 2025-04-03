@@ -25,6 +25,10 @@
 #include "blazesym.h"
 #include "hashmap.h"
 
+#include "pb_common.h"
+#include "pb_encode.h"
+#include "perfetto_trace.pb.h"
+
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 #define __unused __attribute__((unused))
 #define __cleanup(fn) __attribute__((cleanup(fn)))
