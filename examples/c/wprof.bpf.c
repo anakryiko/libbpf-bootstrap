@@ -504,6 +504,7 @@ static int handle_hardirq(struct task_struct *task, struct irqaction *action, in
 	
 	now_ts = bpf_ktime_get_ns();
 	if ((e = prep_task_event(start ? EV_HARDIRQ_ENTER : EV_HARDIRQ_EXIT, now_ts, task))) {
+		e->hardirq.irq = irq;
 		bpf_probe_read_kernel_str(&e->hardirq.name, sizeof(e->hardirq.name), action->name);
 		submit_event(e);
 	}
