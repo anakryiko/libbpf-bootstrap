@@ -571,17 +571,38 @@ int BPF_PROG(wprof_softirq_exit, int vec_nr)
 	return handle_softirq(task, vec_nr, false /*!start*/);
 }
 
+static __always_inline bool is_valid_wq_char(char c)
+{
+	switch (c) {
+	case '_': case '-': case '[': case ']': case '\\': case '/': case '=':
+	case '.': case ',': case ';': case ':':
+	case '0' ... '9':
+	case 'a' ... 'z':
+	case 'A' ... 'Z':
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int handle_workqueue(struct task_struct *task, struct work_struct *work, bool start)
 {
 	struct wprof_event *e;
 	u64 now_ts;
+	int err;
 	
 	now_ts = bpf_ktime_get_ns();
 	if ((e = prep_task_event(start ? EV_WQ_START : EV_WQ_END, now_ts, task))) {
 		struct kthread *k = bpf_core_cast(task->worker_private, struct kthread);
 		struct worker *worker = bpf_core_cast(k->data, struct worker);
 
-		bpf_probe_read_kernel_str(&e->wq.desc, sizeof(e->wq.desc), worker->desc);
+		err = bpf_probe_read_kernel_str(&e->wq.desc, sizeof(e->wq.desc), worker->desc);
+		if (err < 0 || !is_valid_wq_char(e->wq.desc[0])) {
+			e->wq.desc[0] = '?';
+			e->wq.desc[1] = '?';
+			e->wq.desc[2] = '?';
+			e->wq.desc[0] = '\0';
+		}
 		submit_event(e);
 	}
 

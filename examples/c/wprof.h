@@ -94,7 +94,7 @@ struct wprof_event {
 		} timer;
 		struct wprof_hardirq {
 			int irq;
-			char name[WORKER_DESC_LEN - 4];
+			char name[WORKER_DESC_LEN + TASK_COMM_LEN];
 		} hardirq;
 		struct wprof_softirq {
 			int vec_nr;
