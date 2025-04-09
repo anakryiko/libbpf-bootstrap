@@ -513,15 +513,32 @@ int BPF_PROG(wprof_task_free, struct task_struct *p)
 
 static int handle_hardirq(struct task_struct *task, struct irqaction *action, int irq, bool start)
 {
+	struct task_state *s;
 	struct wprof_event *e;
 	u64 now_ts;
 	
+	s = task_state(task->pid);
+	if (!s)
+		return 0;
+
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_SZ(hardirq), start ? EV_HARDIRQ_ENTER : EV_HARDIRQ_EXIT, now_ts, task))) {
+	if (start) {
+		s->hardirq_ts = now_ts;
+		return 0;
+	}
+
+	if (s->hardirq_ts == 0) /* we never recorded matching start, ignore */
+		return 0;
+
+	now_ts = bpf_ktime_get_ns();
+	if ((e = prep_task_event(EV_SZ(hardirq), EV_HARDIRQ_EXIT, now_ts, task))) {
+		e->hardirq.hardirq_ts = s->hardirq_ts;
 		e->hardirq.irq = irq;
 		bpf_probe_read_kernel_str(&e->hardirq.name, sizeof(e->hardirq.name), action->name);
 		submit_event(e);
 	}
+
+	s->hardirq_ts = 0;
 
 	return 0;
 }
@@ -550,14 +567,30 @@ int BPF_PROG(wprof_hardirq_exit, int irq, struct irqaction *action, int ret)
 
 static int handle_softirq(struct task_struct *task, int vec_nr, bool start)
 {
+	struct task_state *s;
 	struct wprof_event *e;
 	u64 now_ts;
 	
+	s = task_state(task->pid);
+	if (!s)
+		return 0;
+
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_SZ(softirq), start ? EV_SOFTIRQ_ENTER : EV_SOFTIRQ_EXIT, now_ts, task))) {
+	if (start) {
+		s->softirq_ts = now_ts;
+		return 0;
+	}
+
+	if (s->softirq_ts == 0) /* we never recorded matching start, ignore */
+		return 0;
+
+	if ((e = prep_task_event(EV_SZ(softirq), EV_SOFTIRQ_EXIT, now_ts, task))) {
+		e->softirq.softirq_ts = s->softirq_ts;
 		e->softirq.vec_nr = vec_nr;
 		submit_event(e);
 	}
+
+	s->softirq_ts = 0;
 
 	return 0;
 }
@@ -630,11 +663,13 @@ static int handle_workqueue(struct task_struct *task, struct work_struct *work, 
 	if (s->wq_ts == 0) /* we never recorded matching start, ignore */
 		return 0;
 
-	if ((e = prep_task_event(EV_SZ(wq), start ? EV_WQ_START : EV_WQ_END, now_ts, task))) {
-		e->wq.wq_dur_ns = now_ts - s->wq_ts;
+	if ((e = prep_task_event(EV_SZ(wq), EV_WQ_END, now_ts, task))) {
+		e->wq.wq_ts = s->wq_ts;
 		__builtin_memcpy(e->wq.desc, s->wq_name, sizeof(e->wq.desc));
 		submit_event(e);
 	}
+
+	s->wq_ts = 0;
 
 	return 0;
 }

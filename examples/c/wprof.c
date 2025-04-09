@@ -1229,8 +1229,6 @@ struct task_state {
 	/* perf counters */
 	__u64 oncpu_ts;
 	__u64 cpu_cycles;
-	__u64 hardirq_ts;
-	__u64 softirq_ts;
 };
 
 static struct hashmap *tasks;
@@ -1473,11 +1471,8 @@ static const char *event_kind_str_map[] = {
 	[EV_WAKEUP_NEW] = "WAKEUP_NEW",
 	[EV_WAKEUP] = "WAKEUP",
 	[EV_WAKING] = "WAKING",
-	[EV_HARDIRQ_ENTER] = "HARDIRQ_ENTER",
 	[EV_HARDIRQ_EXIT] = "HARDIRQ_EXIT",
-	[EV_SOFTIRQ_ENTER] = "HARDIRQ_ENTER",
 	[EV_SOFTIRQ_EXIT] = "SOFTIRQ_EXIT",
-	[EV_WQ_START] = "WQ_START",
 	[EV_WQ_END] = "WQ_END",
 	[EV_FORK] = "FORK",
 	[EV_EXEC] = "EXEC",
@@ -2215,31 +2210,19 @@ static int handle_event(void *_ctx, void *data, size_t size)
 				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
 			}
 			break;
-		case EV_HARDIRQ_ENTER:
 		case EV_HARDIRQ_EXIT:
-			/* see EV_SWITCH handling of fake (because missing) SLICE_BEGIN */
-			if (e->kind == EV_HARDIRQ_EXIT && st->hardirq_ts == 0) {
-				emit_slice_point(env.sess_start_ts, &e->task, IID_NAME_HARDIRQ, "HARDIRQ",
-						 IID_CAT_HARDIRQ, "HARDIRQ", true /* start */) {
-					emit_subobj_start("args");
-					emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
-					emit_kv_int(IID_ANNK_IRQ, "irq", e->hardirq.irq);
-					emit_kv_str(IID_ANNK_ACTION, "action", IID_NONE, e->hardirq.name);
-				}
-			}
-			emit_slice_point(e->ts, &e->task, IID_NAME_HARDIRQ, "HARDIRQ",
-					 IID_CAT_HARDIRQ, "HARDIRQ", e->kind == EV_HARDIRQ_ENTER /* start */) {
+			emit_slice_point(e->hardirq.hardirq_ts, &e->task,
+					 IID_NAME_HARDIRQ, "HARDIRQ",
+					 IID_CAT_HARDIRQ, "HARDIRQ", true /* start */) {
 				emit_subobj_start("args");
 				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
 				emit_kv_int(IID_ANNK_IRQ, "irq", e->hardirq.irq);
 				emit_kv_str(IID_ANNK_ACTION, "action", IID_NONE, e->hardirq.name);
 			}
-			if (e->kind == EV_HARDIRQ_ENTER)
-				st->hardirq_ts = e->ts;
-			else
-				st->hardirq_ts = 0;
+			emit_slice_point(e->ts, &e->task,
+					 IID_NAME_HARDIRQ, "HARDIRQ",
+					 IID_CAT_HARDIRQ, "HARDIRQ", false /* !start */);
 			break;
-		case EV_SOFTIRQ_ENTER:
 		case EV_SOFTIRQ_EXIT: {
 			pb_iid name_iid, act_iid;
 
@@ -2251,34 +2234,21 @@ static int handle_event(void *_ctx, void *data, size_t size)
 				act_iid = IID_NONE;
 			}
 
-			/* see EV_SWITCH handling of fake (because missing) SLICE_BEGIN */
-			if (e->kind == EV_SOFTIRQ_EXIT && st->softirq_ts == 0) {
-				emit_slice_point(env.sess_start_ts, &e->task,
-						 name_iid, sfmt("%s:%s", "SOFTIRQ", softirq_str(e->softirq.vec_nr)),
-						 IID_CAT_SOFTIRQ, "SOFTIRQ", true /* start */) {
-					emit_subobj_start("args");
-					emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
-					emit_kv_str(IID_ANNK_ACTION, "action", act_iid, softirq_str(e->softirq.vec_nr));
-				}
-			}
-
-			emit_slice_point(e->ts, &e->task,
+			emit_slice_point(e->softirq.softirq_ts, &e->task,
 					 name_iid, sfmt("%s:%s", "SOFTIRQ", softirq_str(e->softirq.vec_nr)),
-					 IID_CAT_SOFTIRQ, "SOFTIRQ", e->kind == EV_SOFTIRQ_ENTER /* start */) {
+					 IID_CAT_SOFTIRQ, "SOFTIRQ", true /* start */) {
 				emit_subobj_start("args");
 				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
 				emit_kv_str(IID_ANNK_ACTION, "action", act_iid, softirq_str(e->softirq.vec_nr));
 			}
 
-			if (e->kind == EV_SOFTIRQ_ENTER)
-				st->softirq_ts = e->ts;
-			else
-				st->softirq_ts = 0;
+			emit_slice_point(e->ts, &e->task,
+					 name_iid, sfmt("%s:%s", "SOFTIRQ", softirq_str(e->softirq.vec_nr)),
+					 IID_CAT_SOFTIRQ, "SOFTIRQ", false /* !start */);
 			break;
 		}
-		//case EV_WQ_START:
 		case EV_WQ_END:
-			emit_slice_point(e->ts - e->wq.wq_dur_ns, &e->task,  
+			emit_slice_point(e->wq.wq_ts, &e->task,
 					 IID_NONE, sfmt("%s:%s", "WQ", e->wq.desc),
 					 IID_CAT_WQ, "WQ", true /* start */) {
 				emit_subobj_start("args");

@@ -44,11 +44,8 @@ enum event_kind {
 	EV_WAKEUP_NEW,
 	EV_WAKEUP,
 	EV_WAKING,
-	EV_HARDIRQ_ENTER,
 	EV_HARDIRQ_EXIT,
-	EV_SOFTIRQ_ENTER,
 	EV_SOFTIRQ_EXIT,
-	EV_WQ_START,
 	EV_WQ_END,
 	EV_FORK,
 	EV_EXEC,
@@ -92,14 +89,16 @@ struct wprof_event {
 		struct wprof_timer {
 		} timer;
 		struct wprof_hardirq {
+			__u64 hardirq_ts;
 			int irq;
 			char name[WORKER_DESC_LEN + TASK_COMM_LEN];
 		} hardirq;
 		struct wprof_softirq {
+			__u64 softirq_ts;
 			int vec_nr;
 		} softirq;
 		struct wprof_wq_info {
-			__u32 wq_dur_ns;
+			__u64 wq_ts;
 			char desc[WORKER_DESC_LEN];
 		} wq;
 		struct wprof_task_rename {
