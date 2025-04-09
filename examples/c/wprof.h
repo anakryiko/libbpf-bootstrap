@@ -78,7 +78,6 @@ struct wprof_event {
 	enum event_kind kind;
 	__u32 cpu_id;
 	__u64 ts;
-	__u64 dur_ns;
 	struct wprof_task task;
 
 	union {
@@ -100,6 +99,7 @@ struct wprof_event {
 			int vec_nr;
 		} softirq;
 		struct wprof_wq_info {
+			__u32 wq_dur_ns;
 			char desc[WORKER_DESC_LEN];
 		} wq;
 		struct wprof_task_rename {
@@ -114,6 +114,8 @@ struct wprof_event {
 		} exec;
 	};
 
+	/* DO NOT PUT ANYTHING HERE */
+
 	/*
 	__s32 kstack_sz;
 	__s32 ustack_sz;
@@ -121,5 +123,11 @@ struct wprof_event {
 	stack_trace_t ustack;
 	*/
 };
+
+#ifndef offsetofend
+#define offsetofend(TYPE, MEMBER) (offsetof(TYPE, MEMBER) + sizeof((((TYPE *)0)->MEMBER)))
+#endif
+
+#define EV_SZ(kind) offsetofend(struct wprof_event, kind)
 
 #endif /* __WPROF_H_ */

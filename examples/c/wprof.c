@@ -30,6 +30,8 @@
 #include "perfetto_trace.pb.h"
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
+#define min(x, y) ((x) < (y) ? (x) : (y))
+#define max(x, y) ((x) > (y) ? (x) : (y))
 #define __unused __attribute__((unused))
 #define __cleanup(fn) __attribute__((cleanup(fn)))
 
@@ -54,6 +56,7 @@ static struct env {
 	int task_state_sz;
 
 	__u64 sess_start_ts;
+	__u64 sess_end_ts;
 	const char *trace_path;
 	FILE *trace;
 	pb_ostream_t trace_stream;
@@ -356,6 +359,8 @@ enum pb_static_iid {
 		IID_NAME_WAKEUP,				/* WAKEUP */
 		IID_NAME_WAKEUP_NEW,				/* WAKEUP_NEW */
 		IID_NAME_WAKING,				/* WAKING */
+		IID_NAME_AWOKEN_NEW,				/* AWOKEN_NEW */
+		IID_NAME_AWAKING,				/* AWAKING */
 		IID_NAME_FORKING,				/* FORKING */
 		IID_NAME_FORKED,				/* FORKED */
 		IID_NAME_RENAME,				/* RENAME */
@@ -376,10 +381,13 @@ enum pb_static_iid {
 		IID_ANNK_RENAMED_TO,				/* renamed_to */
 		IID_ANNK_WAKING_CPU,				/* waking_cpu */
 		IID_ANNK_WAKING_DELAY_US,			/* waking_delay_us */
-		IID_ANNK_WAKING_FROM,				/* waking_from */
-		IID_ANNK_WAKING_FROM_TID,			/* waking_from_tid */
-		IID_ANNK_WAKING_FROM_PID,			/* waking_from_pid */
+		IID_ANNK_WAKING_BY,				/* waking_by */
+		IID_ANNK_WAKING_BY_TID,				/* waking_by_tid */
+		IID_ANNK_WAKING_BY_PID,				/* waking_by_pid */
 		IID_ANNK_WAKING_REASON,				/* waking_reason */
+		IID_ANNK_WAKING_TARGET,				/* waking_target */
+		IID_ANNK_WAKING_TARGET_TID,			/* waking_target_tid */
+		IID_ANNK_WAKING_TARGET_PID,			/* waking_target_pid */
 		IID_ANNK_FORKED_INTO,				/* forked_into */
 		IID_ANNK_FORKED_INTO_TID,			/* forked_into_tid */
 		IID_ANNK_FORKED_INTO_PID,			/* forked_into_pid */
@@ -418,6 +426,8 @@ static const char *pb_strs[] = {
 	[IID_NAME_WAKEUP] = "WAKEUP",
 	[IID_NAME_WAKEUP_NEW] = "WAKEUP_NEW",
 	[IID_NAME_WAKING] = "WAKING",
+	[IID_NAME_AWOKEN_NEW] = "AWOKEN_NEW",
+	[IID_NAME_AWAKING] = "AWAKING",
 	[IID_NAME_FORKING] = "FORKING",
 	[IID_NAME_FORKED] = "FORKED",
 	[IID_NAME_RENAME] = "RENAME",
@@ -444,10 +454,13 @@ static const char *pb_strs[] = {
 	[IID_ANNK_RENAMED_TO] = "renamed_to",
 	[IID_ANNK_WAKING_CPU] = "waking_cpu",
 	[IID_ANNK_WAKING_DELAY_US] = "waking_delay_us",
-	[IID_ANNK_WAKING_FROM] = "waking_from",
-	[IID_ANNK_WAKING_FROM_TID] = "waking_from_tid",
-	[IID_ANNK_WAKING_FROM_PID] = "waking_from_pid",
+	[IID_ANNK_WAKING_BY] = "waking_by",
+	[IID_ANNK_WAKING_BY_TID] = "waking_by_tid",
+	[IID_ANNK_WAKING_BY_PID] = "waking_by_pid",
 	[IID_ANNK_WAKING_REASON] = "waking_reason",
+	[IID_ANNK_WAKING_TARGET] = "waking_target",
+	[IID_ANNK_WAKING_TARGET_TID] = "waking_target_tid",
+	[IID_ANNK_WAKING_TARGET_PID] = "waking_target_pid",
 	[IID_ANNK_FORKED_INTO] = "forked_into",
 	[IID_ANNK_FORKED_INTO_TID] = "forked_into_tid",
 	[IID_ANNK_FORKED_INTO_PID] = "forked_into_pid",
@@ -1218,7 +1231,6 @@ struct task_state {
 	__u64 cpu_cycles;
 	__u64 hardirq_ts;
 	__u64 softirq_ts;
-	__u64 wq_ts;
 };
 
 static struct hashmap *tasks;
@@ -1941,24 +1953,38 @@ static void task_state_delete(struct wprof_task *t)
 	free(st);
 }
 
+static __u64 rb_handled_cnt = 0;
+static __u64 rb_handled_sz = 0;
+static __u64 rb_ignored_cnt = 0;
+static __u64 rb_ignored_sz = 0;
+
 /* Receive events from the ring buffer. */
 static int handle_event(void *_ctx, void *data, size_t size)
 {
 	struct wprof_event *e = data;
 	const char *status;
-	struct task_state *st, *pst = NULL;
+	struct task_state *st, *pst = NULL, *fst = NULL;
+
+	if (env.sess_end_ts && (long long)(env.sess_end_ts - e->ts) <= 0) {
+		rb_ignored_cnt++;
+		rb_ignored_sz += sizeof(*e);
+		return exiting ? -EINTR : 0;
+	}
+
+	rb_handled_cnt++;
+	rb_handled_sz += sizeof(*e);
 
 	st = task_state(&e->task);
 
 	switch (e->kind) {
 	case EV_ON_CPU:
-		st->on_cpu_ns += e->dur_ns;
+		//st->on_cpu_ns += e->dur_ns;
 		break;
 	case EV_OFF_CPU:
-		st->off_cpu_ns += e->dur_ns;
+		//st->off_cpu_ns += e->dur_ns;
 		break;
 	case EV_TIMER:
-		st->on_cpu_ns += e->dur_ns;
+		//st->on_cpu_ns += e->dur_ns;
 		break;
 	case EV_SWITCH:
 		/* init switched-from task state, if necessary */
@@ -1968,7 +1994,7 @@ static int handle_event(void *_ctx, void *data, size_t size)
 		break;
 	case EV_FORK:
 		/* init forked child task state */
-		(void)task_state(&e->fork.child);
+		fst = task_state(&e->fork.child);
 		break;
 	case EV_TASK_RENAME:
 		if (st->rename_ts == 0) {
@@ -2007,7 +2033,7 @@ static int handle_event(void *_ctx, void *data, size_t size)
 			}
 			break;
 		case EV_SWITCH: {
-			struct task_state *wst;
+			struct task_state *wst = NULL;
 			const char *prev_name;
 			pb_iid prev_name_iid;
 
@@ -2016,9 +2042,6 @@ static int handle_event(void *_ctx, void *data, size_t size)
 			 */
 			prev_name = pst->rename_ts ? pst->old_comm : e->swtch.prev.comm;
 			prev_name_iid = pst->rename_ts ? IID_NONE : pst->name_iid;
-
-			if (e->swtch.waking_ts)
-				wst = task_state(&e->swtch.waking);
 
 			/* We are about to emit SLICE_END without
 			 * corresponding SLICE_BEING ever being emitted;
@@ -2052,15 +2075,40 @@ static int handle_event(void *_ctx, void *data, size_t size)
 					emit_kv_str(IID_ANNK_RENAMED_TO, "renamed_to", IID_NONE, e->swtch.prev.comm);
 			}
 
+			if (e->swtch.waking_ts) {
+				wst = task_state(&e->swtch.waking);
+
+				/* event on awaker's timeline */
+				emit_instant(e->swtch.waking_ts, &e->swtch.waking,
+					     e->swtch.waking_flags == WF_AWOKEN_NEW ? IID_NAME_WAKEUP_NEW : IID_NAME_WAKING,
+					     e->swtch.waking_flags == WF_AWOKEN_NEW ? "WAKEUP_NEW" : "WAKING") {
+					emit_subobj_start("args");
+					emit_kv_int(IID_ANNK_CPU, "cpu", e->swtch.waking_cpu);
+					emit_kv_str(IID_ANNK_WAKING_TARGET, "waking_target", st->name_iid, e->task.comm);
+					emit_kv_int(IID_ANNK_WAKING_TARGET_TID, "waking_target_tid", task_tid(&e->task));
+					emit_kv_int(IID_ANNK_WAKING_TARGET_PID, "waking_target_pid", e->task.pid);
+				}
+
+				/* event on awoken's timeline */
+				if (e->swtch.waking_cpu != e->cpu_id) {
+					emit_instant(e->swtch.waking_ts, &e->task,
+						     e->swtch.waking_flags == WF_AWOKEN_NEW ? IID_NAME_AWOKEN_NEW : IID_NAME_AWAKING,
+						     e->swtch.waking_flags == WF_AWOKEN_NEW ? "AWOKEN_NEW" : "AWAKING") {
+						emit_subobj_start("args");
+						emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+					}
+				}
+			}
+
 			emit_slice_point(e->ts, &e->task, st->name_iid, e->task.comm,
 					 IID_CAT_ONCPU, "ONCPU", true /*start*/) {
 				emit_subobj_start("args");
 				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
 
 				if (e->swtch.waking_ts) {
-					emit_kv_str(IID_ANNK_WAKING_FROM, "waking_from", wst->name_iid, e->swtch.waking.comm);
-					emit_kv_int(IID_ANNK_WAKING_FROM_TID, "waking_from_tid", task_tid(&e->swtch.waking));
-					emit_kv_int(IID_ANNK_WAKING_FROM_PID, "waking_from_pid", e->swtch.waking.pid);
+					emit_kv_str(IID_ANNK_WAKING_BY, "waking_by", wst->name_iid, e->swtch.waking.comm);
+					emit_kv_int(IID_ANNK_WAKING_BY_TID, "waking_by_tid", task_tid(&e->swtch.waking));
+					emit_kv_int(IID_ANNK_WAKING_BY_PID, "waking_by_pid", e->swtch.waking.pid);
 					emit_kv_str(IID_ANNK_WAKING_REASON, "waking_reason",
 						    IID_NONE, waking_reason_str(e->swtch.waking_flags));
 					emit_kv_int(IID_ANNK_WAKING_CPU, "waking_cpu", e->swtch.waking_cpu);
@@ -2097,8 +2145,6 @@ static int handle_event(void *_ctx, void *data, size_t size)
 			break;
 		}
 		case EV_FORK: {
-			struct task_state *fst = task_state(&e->fork.child);
-
 			emit_instant(e->ts, &e->task, IID_NAME_FORKING, "FORKING") {
 				emit_subobj_start("args");
 				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
@@ -2230,31 +2276,22 @@ static int handle_event(void *_ctx, void *data, size_t size)
 				st->softirq_ts = 0;
 			break;
 		}
-		case EV_WQ_START:
+		//case EV_WQ_START:
 		case EV_WQ_END:
-			/* see EV_SWITCH handling of fake (because missing) SLICE_BEGIN */
-			if (e->kind == EV_WQ_END && st->wq_ts == 0) {
-				emit_slice_point(env.sess_start_ts, &e->task,
-						 IID_NONE, sfmt("%s:%s", "WQ", e->wq.desc),
-						 IID_CAT_WQ, "WQ", true /* start */) {
-					emit_subobj_start("args");
-					emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
-					emit_kv_str(IID_ANNK_ACTION, "action", IID_NONE, e->wq.desc);
-				}
-			}
-			emit_slice_point(e->ts, &e->task,
+			emit_slice_point(e->ts - e->wq.wq_dur_ns, &e->task,  
 					 IID_NONE, sfmt("%s:%s", "WQ", e->wq.desc),
-					 IID_CAT_WQ, "WQ", e->kind == EV_WQ_START /* start */) {
+					 IID_CAT_WQ, "WQ", true /* start */) {
 				emit_subobj_start("args");
 				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
 				emit_kv_str(IID_ANNK_ACTION, "action", IID_NONE, e->wq.desc);
 			}
-			if (e->kind == EV_WQ_START)
-				st->wq_ts = e->ts;
-			else
-				st->wq_ts = 0;
+			emit_slice_point(e->ts, &e->task,
+					 IID_NONE, sfmt("%s:%s", "WQ", e->wq.desc),
+					 IID_CAT_WQ, "WQ", false /* !start */);
 			break;
 		default:
+			fprintf(stderr, "UNHANDLED EVENT %d\n", e->kind);
+			exit(1);
 			break;
 		}
 	}
@@ -2277,7 +2314,7 @@ static int handle_event(void *_ctx, void *data, size_t size)
 
 	printf("%s (%d/%d) @ CPU %d %s %lldus\n",
 	       e->task.comm, e->task.tid, e->task.pid, e->cpu_id,
-	       status, e->dur_ns / 1000);
+	       status, 0LL /* e->dur_ns / 1000 */);
 
 	/*
 	if (e->kstack_sz <= 0 && e->ustack_sz <= 0)
@@ -2306,6 +2343,7 @@ static int handle_event(void *_ctx, void *data, size_t size)
 static void print_exit_summary(struct wprof_bpf *skel, int num_cpus, int exit_code)
 {
 	int err;
+	__u64 total_run_cnt = 0, total_run_ns = 0;
 
 	if (!skel)
 		goto skip_prog_stats;
@@ -2334,9 +2372,23 @@ static void print_exit_summary(struct wprof_bpf *skel, int num_cpus, int exit_co
 		}
 
 		if (env.bpf_stats) {
-			fprintf(stderr, "\t%s: %llu runs for total of %.3lfms.\n",
-				bpf_program__name(prog), info.run_cnt, info.run_time_ns / 1000000.0);
+			fprintf(stderr, "\t%s%-*s %8llu (%6llu/CPU) runs for total of %.3lfms (%.3lfms/CPU).\n",
+				bpf_program__name(prog),
+				(int)max(1, 24 - strlen(bpf_program__name(prog))), ":",
+				info.run_cnt, info.run_cnt / num_cpus,
+				info.run_time_ns / 1000000.0, info.run_time_ns / 1000000.0 / num_cpus);
+			total_run_cnt += info.run_cnt;
+			total_run_ns += info.run_time_ns;
 		}
+	}
+
+	if (env.bpf_stats) {
+		fprintf(stderr, "\t%-24s %8llu (%6llu/CPU) runs for total of %.3lfms (%.3lfms/CPU).\n",
+			"TOTAL:", total_run_cnt, total_run_cnt / num_cpus,
+			total_run_ns / 1000000.0, total_run_ns / 1000000.0 / num_cpus);
+		fprintf(stderr, "\t%-24s %8llu records (%.3lfMBs) processed, %llu records (%.3lfMBs) ignored.\n",
+			"DATA:", rb_handled_cnt, rb_handled_sz / 1024.0 / 1024.0,
+			rb_ignored_cnt, rb_ignored_sz / 1024.0 / 1024.0);
 	}
 
 skip_prog_stats:
@@ -2382,8 +2434,10 @@ skip_rusage:
 	}
 	free(stats);
 
-	if (s.rb_drops)
-		fprintf(stderr, "!!! Ringbuf drops: %llu\n", s.rb_drops);
+	if (s.rb_drops) {
+		fprintf(stderr, "!!! Ringbuf drops: %llu (%llu handled, %.3lf%% drop rate)\n",
+			s.rb_drops, rb_handled_cnt, s.rb_drops * 100.0 / (rb_handled_cnt + s.rb_drops));
+	}
 	if (s.task_state_drops)
 		fprintf(stderr, "!!! Task state drops: %llu\n", s.task_state_drops);
 
@@ -2649,6 +2703,8 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "Running...\n");
 	env.sess_start_ts = ktime_now_ns();
+	if (env.run_dur_ms)
+		env.sess_end_ts = env.sess_start_ts + env.run_dur_ms * 1000000ULL;
 	skel->bss->session_start_ts = env.sess_start_ts;
 
 	/*
@@ -2688,8 +2744,10 @@ cleanup:
 	}
 
 	fprintf(stderr, "Draining...\n");
-	if (ring_buf) /* drain ringbuf */
+	if (ring_buf) { /* drain ringbuf */
+		exiting = false; /* ringbuf callback will stop early, if exiting is set */
 		(void)ring_buffer__consume(ring_buf);
+	}
 
 	if (stats_fd >= 0)
 		close(stats_fd);

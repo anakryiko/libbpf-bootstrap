@@ -20,6 +20,10 @@ struct task_state {
 	struct wprof_task waking_task;
 	enum task_status status;
 	__u64 cpu_cycles;
+	__u64 softirq_ts;
+	__u64 hardirq_ts;
+	__u64 wq_ts;
+	char wq_name[WORKER_DESC_LEN];
 };
 
 struct {
@@ -36,8 +40,10 @@ struct {
 } stats SEC(".maps");
 
 #define inc_stat(stat) ({							\
+	__u64 __s = 0;								\
 	struct wprof_stats *s = bpf_map_lookup_elem(&stats, (void *)&zero);	\
-	if (s) s->stat++;							\
+	if (s) { s->stat++; __s = s->stat; }					\
+	__s;									\
 })
 
 struct {
@@ -67,6 +73,7 @@ const volatile int zero = 0;
 
 static struct task_state empty_task_state;
 
+/* XXX: pass CPU explicitly to avoid unnecessary surprises */
 static __always_inline int task_id(int pid)
 {
 	/* use CPU ID for identifying idle tasks */
@@ -84,7 +91,7 @@ static struct task_state *task_state(int pid)
 		s = bpf_map_lookup_elem(&task_states, &id);
 	}
 	if (!s)
-		inc_stat(task_state_drops);
+		(void)inc_stat(task_state_drops);
 	return s;
 }
 
@@ -152,13 +159,13 @@ static void fill_task_info(struct task_struct *t, struct wprof_task *info)
 	__builtin_memcpy(info->pcomm, t->group_leader->comm, sizeof(info->pcomm));
 }
 
-static struct wprof_event *prep_task_event(enum event_kind kind, u64 now_ts, struct task_struct *p)
+static struct wprof_event *prep_task_event(__u64 sz, enum event_kind kind, u64 now_ts, struct task_struct *p)
 {
 	struct wprof_event *e;
 
-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	e = bpf_ringbuf_reserve(&rb, sz, 0);
 	if (!e) {
-		inc_stat(rb_drops);
+		(void)inc_stat(rb_drops);
 		return NULL;
 	}
 
@@ -216,8 +223,8 @@ int wprof_timer_tick(void *ctx)
 		/* we don't know if we are in IRQ or not, but presume not */
 		scur->status = STATUS_ON_CPU;
 
-	if ((e = prep_task_event(EV_TIMER, now_ts, cur))) {
-		e->dur_ns = dur_ns;
+	if ((e = prep_task_event(EV_SZ(timer), EV_TIMER, now_ts, cur))) {
+		//e->dur_ns = dur_ns;
 		submit_event(e);
 	}
 
@@ -280,17 +287,19 @@ int BPF_PROG(wprof_task_switch,
 	snext->ts = now_ts;
 	snext->waking_ts = 0;
 
+	/*
 	if ((e = prep_task_event(EV_ON_CPU, now_ts, prev))) {
-		e->dur_ns = prev_dur_ns;
+		//e->dur_ns = prev_dur_ns;
 		submit_event(e);
 	}
 
 	if ((e = prep_task_event(EV_OFF_CPU, now_ts, next))) {
-		e->dur_ns = next_dur_ns;
+		//e->dur_ns = next_dur_ns;
 		submit_event(e);
 	}
+	*/
 
-	if ((e = prep_task_event(EV_SWITCH, now_ts, next))) {
+	if ((e = prep_task_event(EV_SZ(swtch), EV_SWITCH, now_ts, next))) {
 		e->swtch.cpu_cycles = cpu_cycles;
 
 		fill_task_info(prev, &e->swtch.prev);
@@ -312,7 +321,7 @@ int BPF_PROG(wprof_task_waking, struct task_struct *p)
 {
 	struct wprof_event *e;
 	struct task_state *s;
-	struct task_struct *task = bpf_get_current_task_btf();
+	struct task_struct *task;
 	u64 now_ts;
 
 	if (!should_trace(p, NULL))
@@ -329,9 +338,11 @@ int BPF_PROG(wprof_task_waking, struct task_struct *p)
 	task = bpf_get_current_task_btf();
 	fill_task_info(task, &s->waking_task);
 
-	if ((e = prep_task_event(EV_WAKING, now_ts, p))) {
+	/*
+	if ((e = prep_task_event(EV_SZ(task), EV_WAKING, now_ts, p))) {
 		submit_event(e);
 	}
+	*/
 
 	return 0;
 }
@@ -362,9 +373,11 @@ int BPF_PROG(wprof_task_wakeup_new, struct task_struct *p)
 	}
 	s->status = STATUS_OFF_CPU;
 
-	if ((e = prep_task_event(EV_WAKEUP_NEW, now_ts, p))) {
+	/*
+	if ((e = prep_task_event(EV_SZ(task), EV_WAKEUP_NEW, now_ts, p))) {
 		submit_event(e);
 	}
+	*/
 
 	return 0;
 }
@@ -379,7 +392,7 @@ int BPF_PROG(wprof_task_wakeup, struct task_struct *p)
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_WAKEUP, now_ts, p))) {
+	if ((e = prep_task_event(EV_SZ(task), EV_WAKEUP, now_ts, p))) {
 		submit_event(e);
 	}
 
@@ -400,7 +413,7 @@ int BPF_PROG(wprof_task_rename, struct task_struct *task, const char *comm)
 
 	now_ts = bpf_ktime_get_ns();
 
-	if ((e = prep_task_event(EV_TASK_RENAME, now_ts, task))) {
+	if ((e = prep_task_event(EV_SZ(rename), EV_TASK_RENAME, now_ts, task))) {
 		bpf_probe_read_kernel_str(e->rename.new_comm, sizeof(e->rename.new_comm), comm);
 		submit_event(e);
 	}
@@ -419,7 +432,7 @@ int BPF_PROG(wprof_task_fork, struct task_struct *parent, struct task_struct *ch
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_FORK, now_ts, parent))) {
+	if ((e = prep_task_event(EV_SZ(fork), EV_FORK, now_ts, parent))) {
 		fill_task_info(child, &e->fork.child);
 		submit_event(e);
 	}
@@ -437,7 +450,7 @@ int BPF_PROG(wprof_task_exec, struct task_struct *p, int old_pid, struct linux_b
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_EXEC, now_ts, p))) {
+	if ((e = prep_task_event(EV_SZ(exec), EV_EXEC, now_ts, p))) {
 		e->exec.old_tid = old_pid;
 		bpf_probe_read_kernel_str(e->exec.filename, sizeof(e->exec.filename), bprm->filename);
 		submit_event(e);
@@ -451,7 +464,7 @@ int BPF_PROG(wprof_task_exit, struct task_struct *p)
 {
 	struct task_state *s;
 	struct wprof_event *e;
-	enum event_kind kind;
+	//enum event_kind kind;
 	u64 now_ts;
 	int id;
 
@@ -463,16 +476,18 @@ int BPF_PROG(wprof_task_exit, struct task_struct *p)
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	kind = s->status == STATUS_ON_CPU ? EV_ON_CPU : EV_OFF_CPU;
+	//kind = s->status == STATUS_ON_CPU ? EV_ON_CPU : EV_OFF_CPU;
 	
 	task_state_delete(p->pid);
 
+	/*
 	if ((e = prep_task_event(kind, now_ts, p))) {
-		e->dur_ns = now_ts - s->ts;
+		//e->dur_ns = now_ts - s->ts;
 		submit_event(e);
 	}
+	*/
 
-	if ((e = prep_task_event(EV_TASK_EXIT, now_ts, p))) {
+	if ((e = prep_task_event(EV_SZ(task), EV_TASK_EXIT, now_ts, p))) {
 		submit_event(e);
 	}
 
@@ -482,7 +497,6 @@ int BPF_PROG(wprof_task_exit, struct task_struct *p)
 SEC("tp_btf/sched_process_free")
 int BPF_PROG(wprof_task_free, struct task_struct *p)
 {
-	struct task_state *s;
 	struct wprof_event *e;
 	u64 now_ts;
 
@@ -490,7 +504,7 @@ int BPF_PROG(wprof_task_free, struct task_struct *p)
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_TASK_FREE, now_ts, p))) {
+	if ((e = prep_task_event(EV_SZ(task), EV_TASK_FREE, now_ts, p))) {
 		submit_event(e);
 	}
 
@@ -503,7 +517,7 @@ static int handle_hardirq(struct task_struct *task, struct irqaction *action, in
 	u64 now_ts;
 	
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(start ? EV_HARDIRQ_ENTER : EV_HARDIRQ_EXIT, now_ts, task))) {
+	if ((e = prep_task_event(EV_SZ(hardirq), start ? EV_HARDIRQ_ENTER : EV_HARDIRQ_EXIT, now_ts, task))) {
 		e->hardirq.irq = irq;
 		bpf_probe_read_kernel_str(&e->hardirq.name, sizeof(e->hardirq.name), action->name);
 		submit_event(e);
@@ -540,7 +554,7 @@ static int handle_softirq(struct task_struct *task, int vec_nr, bool start)
 	u64 now_ts;
 	
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(start ? EV_SOFTIRQ_ENTER : EV_SOFTIRQ_EXIT, now_ts, task))) {
+	if ((e = prep_task_event(EV_SZ(softirq), start ? EV_SOFTIRQ_ENTER : EV_SOFTIRQ_EXIT, now_ts, task))) {
 		e->softirq.vec_nr = vec_nr;
 		submit_event(e);
 	}
@@ -587,22 +601,38 @@ static __always_inline bool is_valid_wq_char(char c)
 
 static int handle_workqueue(struct task_struct *task, struct work_struct *work, bool start)
 {
+	struct task_state *s;
 	struct wprof_event *e;
 	u64 now_ts;
 	int err;
-	
+
+	s = task_state(task->pid);
+	if (!s)
+		return 0;
+
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(start ? EV_WQ_START : EV_WQ_END, now_ts, task))) {
+	if (start) {
 		struct kthread *k = bpf_core_cast(task->worker_private, struct kthread);
 		struct worker *worker = bpf_core_cast(k->data, struct worker);
 
-		err = bpf_probe_read_kernel_str(&e->wq.desc, sizeof(e->wq.desc), worker->desc);
-		if (err < 0 || !is_valid_wq_char(e->wq.desc[0])) {
-			e->wq.desc[0] = '?';
-			e->wq.desc[1] = '?';
-			e->wq.desc[2] = '?';
-			e->wq.desc[0] = '\0';
+		s->wq_ts = now_ts;
+
+		err = bpf_probe_read_kernel_str(s->wq_name, sizeof(s->wq_name), worker->desc);
+		if (err < 0 || !is_valid_wq_char(s->wq_name[0])) {
+			s->wq_name[0] = '?';
+			s->wq_name[1] = '?';
+			s->wq_name[2] = '?';
+			s->wq_name[3] = '\0';
 		}
+		return 0;
+	}
+
+	if (s->wq_ts == 0) /* we never recorded matching start, ignore */
+		return 0;
+
+	if ((e = prep_task_event(EV_SZ(wq), start ? EV_WQ_START : EV_WQ_END, now_ts, task))) {
+		e->wq.wq_dur_ns = now_ts - s->wq_ts;
+		__builtin_memcpy(e->wq.desc, s->wq_name, sizeof(e->wq.desc));
 		submit_event(e);
 	}
 
