@@ -132,9 +132,10 @@ $(BZS_APPS): $(LIBBLAZESYM_OBJ)
 # Build application binary
 $(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
-	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@
+	$(Q)$(CC) $(CFLAGS) $(filter %.c %.a %.o,$^) $(ALL_LDFLAGS) -lelf -lz -o $@
 
-wprof: $(OUTPUT)/pb_common.o $(OUTPUT)/pb_encode.o $(OUTPUT)/perfetto_trace.pb.o
+$(OUTPUT)/wprof.bpf.o: wprof.h
+wprof: $(OUTPUT)/pb_common.o $(OUTPUT)/pb_encode.o $(OUTPUT)/perfetto_trace.pb.o wprof.h
 
 # delete failed targets
 .DELETE_ON_ERROR:

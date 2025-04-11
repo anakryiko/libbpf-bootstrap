@@ -53,8 +53,14 @@ struct {
 } perf_cntrs SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-} rb SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+	__type(key, __u32);
+	__array(values, struct {
+		__uint(type, BPF_MAP_TYPE_RINGBUF);
+		 /* max_entries doesn't matter, just to successfully create inner map proto */
+		__uint(max_entries, 64 * 1024);
+	});
+} rbs SEC(".maps");
 
 const volatile int pid_filter_cnt;
 int pids[1] SEC(".data.pids");
@@ -68,6 +74,8 @@ __u64 cpus[512] SEC(".data.cpus"); /* CPU bitmask, up to 4096 CPUs are supported
 const volatile bool cpu_counters;
 
 __u64 session_start_ts;
+
+const volatile __u64 rb_cnt_bits;
 
 const volatile int zero = 0;
 
@@ -159,11 +167,33 @@ static void fill_task_info(struct task_struct *t, struct wprof_task *info)
 	__builtin_memcpy(info->pcomm, t->group_leader->comm, sizeof(info->pcomm));
 }
 
+static inline __u64 hash_bits(__u64 h, int bits)
+{
+	if (bits == 0)
+		return 0;
+	return (h * 11400714819323198485llu) >> (64 - bits);
+}
+
+static __always_inline __u32 calc_rb_slot(int pid, int cpu)
+{
+	return hash_bits(pid ?: cpu, rb_cnt_bits);
+}
+
 static struct wprof_event *prep_task_event(__u64 sz, enum event_kind kind, u64 now_ts, struct task_struct *p)
 {
 	struct wprof_event *e;
+	void *rb;
+	__u32 cpu = bpf_get_smp_processor_id();
+	__u32 rb_slot = calc_rb_slot(p->pid, cpu);
+	long queued_sz;
 
-	e = bpf_ringbuf_reserve(&rb, sz, 0);
+	rb = bpf_map_lookup_elem(&rbs, &rb_slot);
+	if (!rb) {
+		(void)inc_stat(rb_misses);
+		return NULL;
+	}
+
+	e = bpf_ringbuf_reserve(rb, sz, 0);
 	if (!e) {
 		(void)inc_stat(rb_drops);
 		return NULL;
@@ -171,7 +201,7 @@ static struct wprof_event *prep_task_event(__u64 sz, enum event_kind kind, u64 n
 
 	e->kind = kind;
 	e->ts = now_ts;
-	e->cpu_id = bpf_get_smp_processor_id();
+	e->cpu_id = cpu;
 	fill_task_info(p, &e->task);
 
 	/*
@@ -184,16 +214,23 @@ static struct wprof_event *prep_task_event(__u64 sz, enum event_kind kind, u64 n
 		bpf_get_stack(ctx, event->ustack, sizeof(event->ustack), BPF_F_USER_STACK);
 	*/
 
+	queued_sz = bpf_ringbuf_query(rb, BPF_RB_AVAIL_DATA);
+	if (queued_sz >= 256 * 1024)
+		e->kind = -e->kind; /* mark that we should force ringbuf notification on submit */
+
 	return e;
 }
 
 static void submit_event(struct wprof_event *e)
 {
-	long queued_size = bpf_ringbuf_query(&rb, BPF_RB_AVAIL_DATA);
 	long flags = BPF_RB_NO_WAKEUP;
 
-	if (queued_size >= 256 * 1024)
+	if ((int)e->kind < 0) {
 		flags = BPF_RB_FORCE_WAKEUP;
+		e->kind = -e->kind;
+	} else {
+		flags = BPF_RB_NO_WAKEUP;
+	}
 
 	bpf_ringbuf_submit(e, flags);
 }
@@ -299,15 +336,20 @@ int BPF_PROG(wprof_task_switch,
 	}
 	*/
 
-	if ((e = prep_task_event(EV_SZ(swtch), EV_SWITCH, now_ts, next))) {
-		e->swtch.cpu_cycles = cpu_cycles;
+	if ((e = prep_task_event(EV_SZ(swtch_from), EV_SWITCH_FROM, now_ts, prev))) {
+		e->swtch_from.cpu_cycles = cpu_cycles;
+		fill_task_info(next, &e->swtch_from.next);
+		submit_event(e);
+	}
 
-		fill_task_info(prev, &e->swtch.prev);
-		e->swtch.waking_ts = waking_ts;
+	if ((e = prep_task_event(EV_SZ(swtch_to), EV_SWITCH_TO, now_ts, next))) {
+		e->swtch_to.cpu_cycles = cpu_cycles;
+		fill_task_info(prev, &e->swtch_to.prev);
+		e->swtch_to.waking_ts = waking_ts;
 		if (waking_ts) {
-			e->swtch.waking_cpu = snext->waking_cpu;
-			e->swtch.waking_flags = snext->waking_flags;
-			bpf_probe_read_kernel(&e->swtch.waking, sizeof(snext->waking_task),
+			e->swtch_to.waking_cpu = snext->waking_cpu;
+			e->swtch_to.waking_flags = snext->waking_flags;
+			bpf_probe_read_kernel(&e->swtch_to.waking, sizeof(snext->waking_task),
 					      &snext->waking_task);
 		}
 		submit_event(e);
