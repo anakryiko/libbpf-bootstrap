@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <linux/perf_event.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -1618,6 +1619,9 @@ struct worker_state {
 	FILE *trace;
 	pb_ostream_t stream;
 
+	char *dump_path;
+	FILE *dump;
+
 	/* stats */
 	__u64 rb_handled_cnt;
 	__u64 rb_handled_sz;
@@ -1724,12 +1728,43 @@ static void task_state_delete(struct wprof_task *t)
 /* Receive events from the ring buffer. */
 static int handle_event(void *ctx, void *data, size_t size)
 {
-	struct worker_state *w = ctx;
 	struct wprof_event *e = data;
+	struct worker_state *w = ctx;
+
+	if (exiting)
+		return -EINTR;
+
+	if (env.sess_end_ts && (long long)(env.sess_end_ts - e->ts) <= 0) {
+		w->rb_ignored_cnt++;
+		w->rb_ignored_sz += size;
+		return 0;
+	}
+
+	if (fwrite(&size, sizeof(size), 1, w->dump) != 1 ||
+	    fwrite(data, size, 1, w->dump) != 1) {
+		int err = -errno;
+
+		fprintf(stderr, "Failed to write raw data dump: %d\n", err);
+		return err;
+	}
+
+	w->rb_handled_cnt++;
+	w->rb_handled_sz += size;
+
+	return 0;
+}
+
+/* Receive events from the ring buffer. */
+static int process_event(struct worker_state *w, struct wprof_event *e, size_t size)
+{
 	const char *status;
 	struct task_state *st, *pst = NULL, *fst = NULL, *nst = NULL;
 
 	cur_stream = &w->stream;
+
+	/*
+	if (exiting)
+		return -EINTR;
 
 	if (env.sess_end_ts && (long long)(env.sess_end_ts - e->ts) <= 0) {
 		w->rb_ignored_cnt++;
@@ -1739,6 +1774,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	w->rb_handled_cnt++;
 	w->rb_handled_sz += size;
+	*/
 
 	st = task_state(w, &e->task);
 
@@ -2040,9 +2076,6 @@ static int handle_event(void *ctx, void *data, size_t size)
 	default:
 	}
 
-	if (exiting)
-		return -EINTR;
-
 	if (!env.verbose)
 		return 0;
 
@@ -2336,9 +2369,26 @@ int main(int argc, char **argv)
 	workers = calloc(env.worker_cnt, sizeof(*workers));
 	for (int i = 0; i < env.worker_cnt; i++) {
 		struct worker_state *w = &workers[i];
+		char tmp_path[] = "wprof.dump.XXXXXX";
+		int tmp_fd;
 
 		w->id = i;
 		w->str_iids = hashmap__new(str_hash_fn, str_equal_fn, NULL);
+
+		tmp_fd = mkstemp(tmp_path);
+		if (tmp_fd < 0) {
+			err = -errno;
+			fprintf(stderr, "Failed to create data dump file '%s': %d\n", tmp_path, err);
+			goto cleanup;
+		}
+		w->dump_path = strdup(tmp_path);
+		fprintf(stderr, "Using '%s' for raw data dump...\n", w->dump_path);
+		w->dump = fdopen(tmp_fd, "w+");
+		if (!w->dump) {
+			err = -errno;
+			fprintf(stderr, "Failed to setup data dump file '%s': %d\n", w->dump_path, err);
+			goto cleanup;
+		}
 	}
 
 	/* Prepare ring buffer to receive events from the BPF program. */
@@ -2504,6 +2554,8 @@ int main(int argc, char **argv)
 cleanup:
 	if (skel)
 		wprof_bpf__detach(skel);
+	if (stats_fd >= 0)
+		close(stats_fd);
 	if (links) {
 		for (int cpu = 0; cpu < num_cpus; cpu++)
 			bpf_link__destroy(links[cpu]);
@@ -2521,11 +2573,6 @@ cleanup:
 		free(perf_timer_fds);
 		free(perf_counter_fds);
 	}
-	if (ringbuf_fds) {
-		for (i = 0; i < env.ringbuf_cnt; i++)
-			if (ringbuf_fds[i])
-				close(ringbuf_fds[i]);
-	}
 
 	fprintf(stderr, "Draining...\n");
 	if (ring_buf) { /* drain ringbuf */
@@ -2533,15 +2580,62 @@ cleanup:
 		(void)ring_buffer__consume(ring_buf);
 	}
 
-	if (stats_fd >= 0)
-		close(stats_fd);
+	ring_buffer__free(ring_buf);
+	if (ringbuf_fds) {
+		for (i = 0; i < env.ringbuf_cnt; i++)
+			if (ringbuf_fds[i])
+				close(ringbuf_fds[i]);
+	}
 
+	/* process dumped events, if no error happened */
+	for (i = 0; i < env.worker_cnt; i++) {
+		struct worker_state *w = &workers[i];
+		void *dump_mem;
+		struct wprof_event *rec;
+		size_t dump_sz, rec_sz, off;
+
+		if (err)
+			break;
+
+		fflush(w->dump);
+		dump_sz = file_size(w->dump);
+
+		dump_mem = mmap(NULL, dump_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(w->dump), 0);
+		if (dump_mem == MAP_FAILED) {
+			err = -errno;
+			fprintf(stderr, "Failed to mmap dump file for worker #%d: %d\n", i, err);
+			break;
+		}
+
+		off = 0;
+		while (off < dump_sz) {
+			rec_sz = *(size_t *)(dump_mem + off);
+			rec = (struct wprof_event *)(dump_mem + off + sizeof(rec_sz));
+			err = process_event(w, rec, rec_sz);
+			if (err) {
+				fprintf(stderr, "Failed to process record: %d\n", err);
+				goto cleanup2;
+			}
+			off += sizeof(rec_sz) + rec_sz;
+		}
+
+		err = munmap(dump_mem, dump_sz);
+		if (err < 0) {
+			err = -errno;
+			fprintf(stderr, "Failed to munmap() dump file '%s': %d\n", w->dump_path, err);
+		}
+		fclose(w->dump);
+		w->dump = NULL;
+		unlink(w->dump_path);
+	}
+
+cleanup2:
 	if (env.trace_path) {
 		ssize_t total_file_sz = 0, file_sz, sz;
 		int trace_fd = -1;
 
 		if (err == 0) {
-			trace_fd = open(env.trace_path, O_CLOEXEC | O_CREAT | O_WRONLY, 0644);
+			trace_fd = open(env.trace_path, O_CLOEXEC | O_CREAT | O_TRUNC | O_WRONLY, 0644);
 			if (trace_fd < 0) {
 				err = -errno;
 				fprintf(stderr, "Failed to create FINAL trace file at '%s': %d\n", env.trace_path, err);
@@ -2594,7 +2688,6 @@ cleanup_trace_files:
 
 	print_exit_summary(skel, num_cpus, err);
 
-	ring_buffer__free(ring_buf);
 	wprof_bpf__destroy(skel);
 	blaze_symbolizer_free(symbolizer);
 	free(online_mask);
