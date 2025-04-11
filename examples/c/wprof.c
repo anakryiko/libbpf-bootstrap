@@ -39,7 +39,7 @@
 #define __unused __attribute__((unused))
 #define __cleanup(fn) __attribute__((cleanup(fn)))
 
-#define DEFAULT_RINGBUF_SZ (64 * 1024 * 1024)
+#define DEFAULT_RINGBUF_SZ (8 * 1024 * 1024)
 #define DEFAULT_TASK_STATE_SZ (4 * 4096)
 #define DEFAULT_STATS_PERIOD_MS 5000
 
@@ -59,7 +59,6 @@ static struct env {
 	int ringbuf_sz;
 	int task_state_sz;
 	int ringbuf_cnt;
-	int worker_cnt;
 
 	__u64 sess_start_ts;
 	__u64 sess_end_ts;
@@ -73,7 +72,6 @@ static struct env {
 	.cpu = -1,
 	.ringbuf_sz = DEFAULT_RINGBUF_SZ,
 	.ringbuf_cnt = 1,
-	.worker_cnt = 1,
 	.task_state_sz = DEFAULT_TASK_STATE_SZ,
 	.stats_period_ms = DEFAULT_STATS_PERIOD_MS,
 };
@@ -95,7 +93,6 @@ enum {
 	OPT_PB_DEBUG_INTERNS = 1009,
 	OPT_PB_DISABLE_INTERNS = 1010,
 	OPT_RINGBUF_CNT = 1011,
-	OPT_WORKER_CNT = 1012,
 };
 
 static const struct argp_option opts[] = {
@@ -112,8 +109,7 @@ static const struct argp_option opts[] = {
 
 	{ "ringbuf-size", OPT_RINGBUF_SZ, "SIZE", 0, "BPF ringbuf size (in KBs)" },
 	{ "task-state-size", OPT_TASK_STATE_SZ, "SIZE", 0, "BPF task state map size (in threads)" },
-	{ "ringbuf-cnt", OPT_RINGBUF_CNT, "N", 0, "Number of BPF ringbufs to use for sharding events (will be adjusted to at least the number of workers, but can be larger)" },
-	{ "worker-cnt", OPT_WORKER_CNT, "N", 0, "Number of worker thread to use for processing events" },
+	{ "ringbuf-cnt", OPT_RINGBUF_CNT, "N", 0, "Number of BPF ringbufs to use" },
 
 	{ "cpu-counters", OPT_CPU_COUNTERS, NULL, 0, "Capture and emit CPU cycles counters" },
 	{ "breakout-counters", OPT_BREAKOUT_COUNTERS, NULL, 0, "Emit separate track for counters" },
@@ -197,15 +193,6 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			argp_usage(state);
 		}
 		env.ringbuf_cnt = round_pow_of_2(env.ringbuf_cnt);
-		break;
-	case OPT_WORKER_CNT:
-		errno = 0;
-		env.worker_cnt = strtol(arg, NULL, 0);
-		if (errno || env.worker_cnt < 0) {
-			fprintf(stderr, "Invalid worker count: %s\n", arg);
-			argp_usage(state);
-		}
-		env.worker_cnt = round_pow_of_2(env.worker_cnt);
 		break;
 	case OPT_PRINT_STATS:
 		env.print_stats = true;
@@ -1605,17 +1592,10 @@ static void emit_thread_track_descr(pb_ostream_t *stream, const struct wprof_tas
 	enc_trace_packet(stream, &thread_desc);
 }
 
-#define IID_BATCH 100
-static __u64 next_str_iid = IID_FIXED_LAST_ID;
-static pthread_mutex_t iids_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 struct worker_state {
-	int id;
 	struct hashmap *str_iids;
 	int next_str_iid;
-	int last_str_iid;
 
-	char *trace_path;
 	FILE *trace;
 	pb_ostream_t stream;
 
@@ -1629,7 +1609,7 @@ struct worker_state {
 	__u64 rb_ignored_sz;
 } __attribute__((aligned(64)));
 
-static struct worker_state *workers;
+static struct worker_state *worker;
 
 static pb_iid str_iid_for(struct worker_state *w, const char *s)
 {
@@ -1640,22 +1620,12 @@ static pb_iid str_iid_for(struct worker_state *w, const char *s)
 		return iid;
 
 	sdup = strdup(s);
-
-	if (w->next_str_iid == w->last_str_iid) {
-		pthread_mutex_lock(&iids_mutex);
-
-		w->next_str_iid = next_str_iid;
-		w->last_str_iid = next_str_iid + IID_BATCH;
-		next_str_iid += IID_BATCH;
-
-		pthread_mutex_unlock(&iids_mutex);
-	}
 	iid = w->next_str_iid++;
 
 	hashmap__set(w->str_iids, sdup, iid, NULL, NULL);
 
 	if (env.pb_debug_interns)
-		fprintf(stderr, "%03ld: %-20s [dynamic, worker #%d]\n", iid, sdup, w->id);
+		fprintf(stderr, "%03ld: %-20s [dynamic]\n", iid, sdup);
 	return iid;
 }
 
@@ -1760,22 +1730,6 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 	const char *status;
 	struct task_state *st, *pst = NULL, *fst = NULL, *nst = NULL;
 
-	cur_stream = &w->stream;
-
-	/*
-	if (exiting)
-		return -EINTR;
-
-	if (env.sess_end_ts && (long long)(env.sess_end_ts - e->ts) <= 0) {
-		w->rb_ignored_cnt++;
-		w->rb_ignored_sz += size;
-		return exiting ? -EINTR : 0;
-	}
-
-	w->rb_handled_cnt++;
-	w->rb_handled_sz += size;
-	*/
-
 	st = task_state(w, &e->task);
 
 	switch (e->kind) {
@@ -1790,7 +1744,6 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 		break;
 	case EV_SWITCH_FROM:
 		nst = task_state(w, &e->swtch_from.next);
-		st->cpu_cycles = e->swtch_from.cpu_cycles;
 		break;
 	case EV_SWITCH_TO:
 		/* init switched-from task state, if necessary */
@@ -2107,6 +2060,60 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 	return 0;
 }
 
+static ssize_t file_size(FILE *f)
+{
+	int fd = fileno(f);
+	struct stat st;
+
+	if (fstat(fd, &st))
+		return -errno;
+
+	return st.st_size;
+}
+
+static int process_raw_dump(struct worker_state *w)
+{
+	void *dump_mem;
+	struct wprof_event *rec;
+	size_t dump_sz, rec_sz, off;
+	int err;
+
+	cur_stream = &w->stream;
+
+	fflush(w->dump);
+	dump_sz = file_size(w->dump);
+
+	dump_mem = mmap(NULL, dump_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(w->dump), 0);
+	if (dump_mem == MAP_FAILED) {
+		err = -errno;
+		fprintf(stderr, "Failed to mmap dump file '%s': %d\n", w->dump_path, err);
+		return err;
+	}
+
+	off = 0;
+	while (off < dump_sz) {
+		rec_sz = *(size_t *)(dump_mem + off);
+		rec = (struct wprof_event *)(dump_mem + off + sizeof(rec_sz));
+		err = process_event(w, rec, rec_sz);
+		if (err) {
+			fprintf(stderr, "Failed to process record: %d\n", err);
+			return err; /* YEAH, I know about all the clean up, whatever */
+		}
+		off += sizeof(rec_sz) + rec_sz;
+	}
+
+	err = munmap(dump_mem, dump_sz);
+	if (err < 0) {
+		err = -errno;
+		fprintf(stderr, "Failed to munmap() dump file '%s': %d\n", w->dump_path, err);
+		return err;
+	}
+	fclose(w->dump);
+	w->dump = NULL;
+	unlink(w->dump_path);
+	return 0;
+}
+
 static void print_exit_summary(struct wprof_bpf *skel, int num_cpus, int exit_code)
 {
 	int err;
@@ -2114,14 +2121,10 @@ static void print_exit_summary(struct wprof_bpf *skel, int num_cpus, int exit_co
 	__u64 rb_handled_cnt = 0, rb_ignored_cnt = 0;
 	__u64 rb_handled_sz = 0, rb_ignored_sz = 0;
 
-	for (int i = 0; i < env.worker_cnt; i++) {
-		struct worker_state *w = &workers[i];
-
-		rb_handled_cnt += w->rb_handled_cnt;
-		rb_handled_sz += w->rb_handled_sz;
-		rb_ignored_cnt += w->rb_ignored_cnt;
-		rb_ignored_sz += w->rb_ignored_sz;
-	}
+	rb_handled_cnt += worker->rb_handled_cnt;
+	rb_handled_sz += worker->rb_handled_sz;
+	rb_ignored_cnt += worker->rb_ignored_cnt;
+	rb_ignored_sz += worker->rb_ignored_sz;
 
 	if (!skel)
 		goto skip_prog_stats;
@@ -2228,17 +2231,6 @@ skip_drop_stats:
 		(ktime_now_ns() - env.sess_start_ts) / 1000000000.0);
 }
 
-static ssize_t file_size(FILE *f)
-{
-	int fd = fileno(f);
-	struct stat st;
-
-	if (fstat(fd, &st))
-		return -errno;
-
-	return st.st_size;
-}
-
 struct timer_plan {
 	int cpu;
 	__u64 delay_ns;
@@ -2261,7 +2253,7 @@ int main(int argc, char **argv)
 	struct perf_event_attr attr;
 	struct bpf_link **links = NULL;
 	struct ring_buffer *ring_buf = NULL;
-	int num_cpus, num_online_cpus;
+	int num_cpus = 0, num_online_cpus;
 	int *perf_timer_fds = NULL, *perf_counter_fds = NULL, pefd;
 	int *ringbuf_fds = NULL;
 	int i, err = 0;
@@ -2280,11 +2272,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Can't specify --print-stats and --run-dur-ms at the same time!\n");
 		err = -1;
 		goto cleanup;
-	}
-
-	if (env.ringbuf_cnt < env.worker_cnt) {
-		env.ringbuf_cnt = round_pow_of_2(env.worker_cnt);
-		fprintf(stderr, "Adjusting number of BPF ringbufs to %d to keep all workers busy!\n", env.ringbuf_cnt);
 	}
 
 	libbpf_set_print(libbpf_print_fn);
@@ -2366,39 +2353,38 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	workers = calloc(env.worker_cnt, sizeof(*workers));
-	for (int i = 0; i < env.worker_cnt; i++) {
-		struct worker_state *w = &workers[i];
-		char tmp_path[] = "wprof.dump.XXXXXX";
-		int tmp_fd;
+	struct worker_state *w = calloc(1, sizeof(*w));
+	char tmp_path[] = "wprof.dump.XXXXXX";
+	int tmp_fd;
 
-		w->id = i;
-		w->str_iids = hashmap__new(str_hash_fn, str_equal_fn, NULL);
+	w->str_iids = hashmap__new(str_hash_fn, str_equal_fn, NULL);
+	w->next_str_iid = IID_FIXED_LAST_ID;
 
-		tmp_fd = mkstemp(tmp_path);
-		if (tmp_fd < 0) {
-			err = -errno;
-			fprintf(stderr, "Failed to create data dump file '%s': %d\n", tmp_path, err);
-			goto cleanup;
-		}
-		w->dump_path = strdup(tmp_path);
-		fprintf(stderr, "Using '%s' for raw data dump...\n", w->dump_path);
-		w->dump = fdopen(tmp_fd, "w+");
-		if (!w->dump) {
-			err = -errno;
-			fprintf(stderr, "Failed to setup data dump file '%s': %d\n", w->dump_path, err);
-			goto cleanup;
-		}
+	tmp_fd = mkstemp(tmp_path);
+	if (tmp_fd < 0) {
+		err = -errno;
+		fprintf(stderr, "Failed to create data dump file '%s': %d\n", tmp_path, err);
+		goto cleanup;
+	}
+	w->dump_path = strdup(tmp_path);
+	fprintf(stderr, "Using '%s' for raw data dump...\n", w->dump_path);
+	w->dump = fdopen(tmp_fd, "w+");
+	if (!w->dump) {
+		err = -errno;
+		fprintf(stderr, "Failed to setup data dump file '%s': %d\n", w->dump_path, err);
+		goto cleanup;
 	}
 
+	worker = w;
+
 	/* Prepare ring buffer to receive events from the BPF program. */
-	ring_buf = ring_buffer__new(ringbuf_fds[0], handle_event, &workers[0], NULL);
+	ring_buf = ring_buffer__new(ringbuf_fds[0], handle_event, worker, NULL);
 	if (!ring_buf) {
 		err = -1;
 		goto cleanup;
 	}
 	for (i = 1; i < env.ringbuf_cnt; i++) {
-		err = ring_buffer__add(ring_buf, ringbuf_fds[i], handle_event, &workers[i % env.worker_cnt]);
+		err = ring_buffer__add(ring_buf, ringbuf_fds[i], handle_event, worker);
 		if (err) {
 			fprintf(stderr, "Failed to create ring buffer manager for ringbuf #%d: %d\n", i, err);
 			goto cleanup;
@@ -2490,24 +2476,20 @@ int main(int argc, char **argv)
 	}
 
 	if (env.trace_path) {
-		for (int i = 0; i < env.worker_cnt; i++) {
-			struct worker_state *w = &workers[i];
-			const char *trace_path = sfmt("%s.w%d", env.trace_path, i);
+		struct worker_state *w = worker;
 
-			w->trace_path = strdup(trace_path);
-			w->trace = fopen(trace_path, "w+");
-			if (!w->trace) {
-				err = -errno;
-				fprintf(stderr, "Failed to create trace file for worker #%d at '%s': %d\n", i, trace_path, err);
-				goto cleanup;
-			}
-			w->stream = (pb_ostream_t){&file_stream_cb, w->trace, SIZE_MAX, 0};
+		w->trace = fopen(env.trace_path, "w+");
+		if (!w->trace) {
+			err = -errno;
+			fprintf(stderr, "Failed to create trace file '%s': %d\n", env.trace_path, err);
+			goto cleanup;
+		}
+		w->stream = (pb_ostream_t){&file_stream_cb, w->trace, SIZE_MAX, 0};
 
-			if (i == 0 && init_protobuf(&w->stream)) {
-				err = -1;
-				fprintf(stderr, "Failed to init protobuf!\n");
-				goto cleanup;
-			}
+		if (init_protobuf(&w->stream)) {
+			err = -1;
+			fprintf(stderr, "Failed to init protobuf!\n");
+			goto cleanup;
 		}
 	}
 
@@ -2588,104 +2570,24 @@ cleanup:
 	}
 
 	/* process dumped events, if no error happened */
-	for (i = 0; i < env.worker_cnt; i++) {
-		struct worker_state *w = &workers[i];
-		void *dump_mem;
-		struct wprof_event *rec;
-		size_t dump_sz, rec_sz, off;
+	if (err == 0) {
+		ssize_t file_sz;
 
-		if (err)
-			break;
-
-		fflush(w->dump);
-		dump_sz = file_size(w->dump);
-
-		dump_mem = mmap(NULL, dump_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(w->dump), 0);
-		if (dump_mem == MAP_FAILED) {
-			err = -errno;
-			fprintf(stderr, "Failed to mmap dump file for worker #%d: %d\n", i, err);
-			break;
+		err = process_raw_dump(worker);
+		if (err) {
+			fprintf(stderr, "Failed to process raw data dump: %d\n", err);
+			goto cleanup2;
 		}
 
-		off = 0;
-		while (off < dump_sz) {
-			rec_sz = *(size_t *)(dump_mem + off);
-			rec = (struct wprof_event *)(dump_mem + off + sizeof(rec_sz));
-			err = process_event(w, rec, rec_sz);
-			if (err) {
-				fprintf(stderr, "Failed to process record: %d\n", err);
-				goto cleanup2;
-			}
-			off += sizeof(rec_sz) + rec_sz;
-		}
+		fflush(worker->trace);
+		file_sz = file_size(worker->trace);
+		fprintf(stderr, "Produced %.3lfMB trace file at '%s'.\n",
+			file_sz / (1024.0 * 1024.0), env.trace_path);
 
-		err = munmap(dump_mem, dump_sz);
-		if (err < 0) {
-			err = -errno;
-			fprintf(stderr, "Failed to munmap() dump file '%s': %d\n", w->dump_path, err);
-		}
-		fclose(w->dump);
-		w->dump = NULL;
-		unlink(w->dump_path);
+		fclose(worker->trace);
 	}
 
 cleanup2:
-	if (env.trace_path) {
-		ssize_t total_file_sz = 0, file_sz, sz;
-		int trace_fd = -1;
-
-		if (err == 0) {
-			trace_fd = open(env.trace_path, O_CLOEXEC | O_CREAT | O_TRUNC | O_WRONLY, 0644);
-			if (trace_fd < 0) {
-				err = -errno;
-				fprintf(stderr, "Failed to create FINAL trace file at '%s': %d\n", env.trace_path, err);
-				goto cleanup_trace_files;
-			}
-		}
-
-		for (int i = 0; i < env.worker_cnt; i++) {
-			struct worker_state *w = &workers[i];
-
-			if (!w->trace)
-				continue;
-
-			fflush(w->trace);
-			file_sz = file_size(w->trace);
-			total_file_sz += file_sz;
-
-			fprintf(stderr, "Worker #%d produced %.3lfMB trace file at '%s'.\n",
-				i, file_sz / (1024.0 * 1024.0), w->trace_path);
-
-			off_t off_in = 0;
-			while (file_sz > 0 && (sz = copy_file_range(fileno(w->trace), &off_in, trace_fd, NULL, file_sz, 0)) > 0) {
-				file_sz -= sz;
-			}
-
-			if (sz < 0 || (sz == 0 && file_sz > 0)) {
-				err = -errno;
-				fprintf(stderr, "Failed to append worker #%d's data into FINAL trace (result %zd, remaining bytes %zd): %d\n",
-					i, sz, file_sz, err);
-				goto cleanup_trace_files;
-			}
-		}
-
-		fprintf(stderr, "Produced %.3lfMB FINAL trace file at '%s'.\n",
-			total_file_sz / (1024.0 * 1024.0), env.trace_path);
-
-cleanup_trace_files:
-		if (trace_fd >= 0)
-			close(trace_fd);
-
-		for (int i = 0; i < env.worker_cnt; i++) {
-			struct worker_state *w = &workers[i];
-
-			if (w->trace) {
-				fclose(w->trace);
-				unlink(w->trace_path);
-			}
-		}
-	}
-
 	print_exit_summary(skel, num_cpus, err);
 
 	wprof_bpf__destroy(skel);

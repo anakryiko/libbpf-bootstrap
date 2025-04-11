@@ -41,7 +41,6 @@ enum event_kind {
 	EV_ON_CPU,
 	EV_OFF_CPU,
 	EV_TIMER,
-	EV_SWITCH,
 	EV_SWITCH_FROM,
 	EV_SWITCH_TO,
 	EV_WAKEUP_NEW,
