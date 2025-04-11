@@ -48,7 +48,6 @@ static struct env {
 	bool bpf_stats;
 	bool libbpf_logs;
 	bool print_stats;
-	bool cpu_counters;
 	bool breakout_counters;
 	int freq;
 	int stats_period_ms; 
@@ -66,6 +65,9 @@ static struct env {
 
 	bool pb_debug_interns;
 	bool pb_disable_interns;
+
+	int counter_cnt;
+	int counter_ids[MAX_PERF_COUNTERS];
 } env = {
 	.freq = 100,
 	.pid = -1,
@@ -86,9 +88,7 @@ enum {
 	OPT_STATS_PERIOD = 1002,
 	OPT_BPF_STATS = 1003,
 	OPT_LIBBPF_LOGS = 1004,
-	OPT_RUN_DUR_MS = 1005,
 	OPT_PRINT_STATS = 1006,
-	OPT_CPU_COUNTERS = 1007,
 	OPT_BREAKOUT_COUNTERS = 1008,
 	OPT_PB_DEBUG_INTERNS = 1009,
 	OPT_PB_DISABLE_INTERNS = 1010,
@@ -111,12 +111,12 @@ static const struct argp_option opts[] = {
 	{ "task-state-size", OPT_TASK_STATE_SZ, "SIZE", 0, "BPF task state map size (in threads)" },
 	{ "ringbuf-cnt", OPT_RINGBUF_CNT, "N", 0, "Number of BPF ringbufs to use" },
 
-	{ "cpu-counters", OPT_CPU_COUNTERS, NULL, 0, "Capture and emit CPU cycles counters" },
+	{ "cpu-counter", 'C', "NAME", 0, "Capture and emit specified perf/CPU/hardware counter (cpu-cycles, cpu-insns, cache-hits, cache-misses, stalled-cycles-fe, stallec-cycles-be)" },
 	{ "breakout-counters", OPT_BREAKOUT_COUNTERS, NULL, 0, "Emit separate track for counters" },
 
 	{ "print-stats", OPT_PRINT_STATS, NULL, 0, "Print stats periodically" },
 	{ "stats-period", OPT_STATS_PERIOD, "PERIOD", 0, "Stats printing period (in ms)" },
-	{ "run-dur-ms", OPT_RUN_DUR_MS, "DURATION", 0, "Limit running duration to given number of ms" },
+	{ "run-dur-ms", 'D', "DURATION", 0, "Limit running duration to given number of ms" },
 
 	{ "debug-interns", OPT_PB_DEBUG_INTERNS, NULL, 0, "Emit interned strings" },
 	{ "pb-disable-interns", OPT_PB_DISABLE_INTERNS, NULL, 0, "Disable string interning for Perfetto traces" },
@@ -124,6 +124,17 @@ static const struct argp_option opts[] = {
 };
 
 static int round_pow_of_2(int n);
+
+struct perf_counter_def {
+	const char *alias;
+	int perf_type;
+	int perf_cfg;
+	double mul;
+	const char *trace_name;
+	__u32 trace_name_iid;
+};
+
+static const struct perf_counter_def perf_counter_defs[];
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
@@ -197,9 +208,38 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case OPT_PRINT_STATS:
 		env.print_stats = true;
 		break;
-	case OPT_CPU_COUNTERS:
-		env.cpu_counters = true;
+	case 'C': {
+		int counter_idx = -1;
+
+		for (int i = 0; perf_counter_defs[i].alias; i++) {
+			if (strcmp(arg, perf_counter_defs[i].alias) != 0)
+				continue;
+
+			counter_idx = i;
+			break;
+		}
+
+		if (counter_idx < 0) {
+			fprintf(stderr, "Unrecognized counter '%s'!\n", arg);
+			argp_usage(state);
+		}
+
+		for (int i = 0; i < env.counter_cnt; i++) {
+			if (env.counter_ids[i] == counter_idx) {
+				counter_idx = -1;
+				break;
+			}
+		}
+
+		if (counter_idx >= 0) {
+			if (env.counter_cnt >= MAX_PERF_COUNTERS) {
+				fprintf(stderr, "Too many perf counters requested, only %d are currently supported!\n", MAX_PERF_COUNTERS);
+				return -E2BIG;
+			}
+			env.counter_ids[env.counter_cnt++] = counter_idx;
+		}
 		break;
+	}
 	case OPT_BREAKOUT_COUNTERS:
 		env.breakout_counters = true;
 		break;
@@ -211,7 +251,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			argp_usage(state);
 		}
 		break;
-	case OPT_RUN_DUR_MS:
+	case 'D':
 		errno = 0;
 		env.run_dur_ms = strtol(arg, NULL, 0);
 		if (errno || env.run_dur_ms < 0) {
@@ -427,8 +467,14 @@ enum pb_static_iid {
 		IID_ANNK_TID_CHANGED_FROM,			/* tid_changed_from */
 		IID_ANNK_OLD_NAME,				/* old_name */
 		IID_ANNK_NEW_NAME,				/* new_name */
-		IID_ANNK_ACTION,					/* action */
+		IID_ANNK_ACTION,				/* action */
 		IID_ANNK_IRQ,					/* irq */
+		IID_ANNK_PERF_CPU_CYCLES,			/* cpu_cycles_kilo */
+		IID_ANNK_PERF_CPU_INSNS,			/* cpu_insns_kilo */
+		IID_ANNK_PERF_CACHE_HITS,			/* cache_hits_kilo */
+		IID_ANNK_PERF_CACHE_MISSES,			/* cache_misses_kilo */
+		IID_ANNK_PERF_STALL_CYCLES_FE,			/* stalled_cycles_fe_kilo */
+		IID_ANNK_PERF_STALL_CYCLES_BE,			/* stalled_cycles_be_kilo */
 	ANNK_END_IID,
 
 	ANNV_START_IID, __ANNV_RESET_IID = ANNV_START_IID - 1,
@@ -502,6 +548,12 @@ static const char *pb_strs[] = {
 	[IID_ANNK_NEW_NAME] = "new_name",
 	[IID_ANNK_ACTION] = "action",
 	[IID_ANNK_IRQ] = "irq",
+	[IID_ANNK_PERF_CPU_CYCLES] = "cpu_cycles_kilo",
+	[IID_ANNK_PERF_CPU_INSNS] = "cpu_insns_kilo",
+	[IID_ANNK_PERF_CACHE_HITS] = "cache_hits_kilo",
+	[IID_ANNK_PERF_CACHE_MISSES] = "cache_misses_kilo",
+	[IID_ANNK_PERF_STALL_CYCLES_FE] = "stalled_cycles_fe_kilo",
+	[IID_ANNK_PERF_STALL_CYCLES_BE] = "stalled_cycles_be_kilo",
 
 	[IID_ANNV_SOFTIRQ_ACTION + HI_SOFTIRQ] = "hi",
 	[IID_ANNV_SOFTIRQ_ACTION + TIMER_SOFTIRQ] = "timer",
@@ -1045,6 +1097,16 @@ static __u64 ktime_now_ns()
 	return timespec_to_ns(&t);
 }
 
+static const struct perf_counter_def perf_counter_defs[] = {
+	{ "cpu-cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, 1e-3, "cpu_cycles_kilo", IID_ANNK_PERF_CPU_CYCLES },
+	{ "cpu-insns", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, 1e-3, "cpu_insns_kilo", IID_ANNK_PERF_CPU_INSNS },
+	{ "cache-hits", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES, 1e-3, "cache_hits_kilo", IID_ANNK_PERF_CACHE_HITS },
+	{ "cache-misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES, 1e-3, "cache_misses_kilo", IID_ANNK_PERF_CACHE_MISSES },
+	{ "stall-cycles-fe", PERF_TYPE_HARDWARE, PERF_COUNT_HW_STALLED_CYCLES_FRONTEND, 1e-3, "stalled_cycles_fe_kilo", IID_ANNK_PERF_STALL_CYCLES_FE },
+	{ "stall-cycles-be", PERF_TYPE_HARDWARE, PERF_COUNT_HW_STALLED_CYCLES_BACKEND, 1e-3, "stalled_cycles_be_kilo", IID_ANNK_PERF_STALL_CYCLES_BE },
+	{},
+};
+
 struct task_state {
 	int tid, pid;
 	pb_iid name_iid;
@@ -1058,7 +1120,7 @@ struct task_state {
 	uint64_t off_cpu_ns;
 	/* perf counters */
 	__u64 oncpu_ts;
-	__u64 cpu_cycles;
+	struct perf_counters oncpu_ctrs;
 };
 
 static struct hashmap *tasks;
@@ -1748,7 +1810,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 	case EV_SWITCH_TO:
 		/* init switched-from task state, if necessary */
 		pst = task_state(w, &e->swtch_to.prev);
-		st->cpu_cycles = e->swtch_to.cpu_cycles;
+		st->oncpu_ctrs = e->swtch_to.ctrs;
 		st->oncpu_ts = e->ts;
 		break;
 	case EV_FORK:
@@ -1823,14 +1885,23 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 				emit_kv_str(IID_ANNK_SWITCH_TO, "switch_to", nst->name_iid, e->swtch_from.next.comm);
 				emit_kv_int(IID_ANNK_SWITCH_TO_TID, "switch_to_tid", task_tid(&e->swtch_from.next));
 				emit_kv_int(IID_ANNK_SWITCH_TO_PID, "switch_to_pid", e->swtch_from.next.pid);
-				if (env.cpu_counters && st->cpu_cycles && e->swtch_from.cpu_cycles) {
-					emit_kv_float(IID_ANNK_CPU_MEGA_CYCLES, "cpu_mega_cycles",
-						      "%.6lf", (e->swtch_from.cpu_cycles - st->cpu_cycles) / 1000000.0);
+
+				for (int i = 0; i < env.counter_cnt; i++) {
+					const struct perf_counter_def *def = &perf_counter_defs[env.counter_ids[i]];
+					const struct perf_counters *st_ctrs = &st->oncpu_ctrs;
+					const struct perf_counters *ev_ctrs = &e->swtch_from.ctrs;
+
+					if (st_ctrs->val[i] && ev_ctrs->val[i]) {
+						emit_kv_float(def->trace_name_iid, def->trace_name,
+							      "%.6lf", (ev_ctrs->val[i] - st_ctrs->val[i]) * def->mul);
+					}
 				}
+
 				if (st->rename_ts)
 					emit_kv_str(IID_ANNK_RENAMED_TO, "renamed_to", IID_NONE, e->task.comm);
 			}
 
+			/*
 			if (env.cpu_counters && env.breakout_counters &&
 			    st->oncpu_ts && st->cpu_cycles && e->swtch_from.cpu_cycles) {
 				emit_counter(st->oncpu_ts, &e->task, IID_NONE, "cpu_cycles") {
@@ -1841,6 +1912,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 					emit_kv_float(IID_NONE, "mega_cycles", "%.6lf", 0.0);
 				}
 			}
+			*/
 
 			if (st->rename_ts) {
 				st->rename_ts = 0;
@@ -1976,7 +2048,14 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 			}
 			emit_slice_point(e->ts, &e->task,
 					 IID_NAME_HARDIRQ, "HARDIRQ",
-					 IID_CAT_HARDIRQ, "HARDIRQ", false /* !start */);
+					 IID_CAT_HARDIRQ, "HARDIRQ", false /* !start */) {
+				for (int i = 0; i < env.counter_cnt; i++) {
+					const struct perf_counter_def *def = &perf_counter_defs[env.counter_ids[i]];
+
+					emit_kv_float(def->trace_name_iid, def->trace_name,
+						      "%.6lf", e->hardirq.ctrs.val[i] * def->mul);
+				}
+			}
 			break;
 		case EV_SOFTIRQ_EXIT: {
 			pb_iid name_iid, act_iid;
@@ -1998,7 +2077,14 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 
 			emit_slice_point(e->ts, &e->task,
 					 name_iid, sfmt("%s:%s", "SOFTIRQ", softirq_str(e->softirq.vec_nr)),
-					 IID_CAT_SOFTIRQ, "SOFTIRQ", false /* !start */);
+					 IID_CAT_SOFTIRQ, "SOFTIRQ", false /* !start */) {
+				for (int i = 0; i < env.counter_cnt; i++) {
+					const struct perf_counter_def *def = &perf_counter_defs[env.counter_ids[i]];
+
+					emit_kv_float(def->trace_name_iid, def->trace_name,
+						      "%.6lf", e->softirq.ctrs.val[i] * def->mul);
+				}
+			}
 			break;
 		}
 		case EV_WQ_END:
@@ -2010,7 +2096,14 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 			}
 			emit_slice_point(e->ts, &e->task,
 					 IID_NONE, sfmt("%s:%s", "WQ", e->wq.desc),
-					 IID_CAT_WQ, "WQ", false /* !start */);
+					 IID_CAT_WQ, "WQ", false /* !start */) {
+				for (int i = 0; i < env.counter_cnt; i++) {
+					const struct perf_counter_def *def = &perf_counter_defs[env.counter_ids[i]];
+
+					emit_kv_float(def->trace_name_iid, def->trace_name,
+						      "%.6lf", e->wq.ctrs.val[i] * def->mul);
+				}
+			}
 			break;
 		default:
 			fprintf(stderr, "UNHANDLED EVENT %d\n", e->kind);
@@ -2023,7 +2116,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 	switch (e->kind) {
 	case EV_SWITCH_FROM:
 		/* init switched-from task state, if necessary */
-		st->cpu_cycles = 0;
+		memset(&st->oncpu_ctrs, 0, sizeof(struct perf_counters));
 		st->oncpu_ts = 0;
 		break;
 	default:
@@ -2254,7 +2347,7 @@ int main(int argc, char **argv)
 	struct bpf_link **links = NULL;
 	struct ring_buffer *ring_buf = NULL;
 	int num_cpus = 0, num_online_cpus;
-	int *perf_timer_fds = NULL, *perf_counter_fds = NULL, pefd;
+	int *perf_timer_fds = NULL, *perf_counter_fds = NULL, perf_counter_fd_cnt = 0, pefd;
 	int *ringbuf_fds = NULL;
 	int i, err = 0;
 	bool *online_mask = NULL;
@@ -2302,12 +2395,14 @@ int main(int argc, char **argv)
 
 	bpf_map__set_max_entries(skel->maps.rbs, env.ringbuf_cnt);
 	bpf_map__set_max_entries(skel->maps.task_states, env.task_state_sz);
-	bpf_map__set_max_entries(skel->maps.perf_cntrs, num_cpus);
 	if (env.cpu >= 0) {
 		skel->rodata->cpu_filter = true;
 		skel->data_cpus->cpus[env.cpu / 64] |= (1ULL << ((env.cpu) % 64));
 	}
-	skel->rodata->cpu_counters = env.cpu_counters;
+
+	perf_counter_fd_cnt = num_cpus * env.counter_cnt;
+	skel->rodata->perf_ctr_cnt = env.counter_cnt;
+	bpf_map__set_max_entries(skel->maps.perf_cntrs, perf_counter_fd_cnt);
 
 	skel->rodata->rb_cnt_bits = 0;
 	while ((1ULL << skel->rodata->rb_cnt_bits) < env.ringbuf_cnt)
@@ -2392,10 +2487,11 @@ int main(int argc, char **argv)
 	}
 
 	perf_timer_fds = malloc(num_cpus * sizeof(int));
-	perf_counter_fds = malloc(num_cpus * sizeof(int));
+	perf_counter_fds = malloc(perf_counter_fd_cnt * sizeof(int));
 	for (i = 0; i < num_cpus; i++) {
 		perf_timer_fds[i] = -1;
-		perf_counter_fds[i] = -1;
+		for (int j = 0; j < env.counter_cnt; j++)
+			perf_counter_fds[i * env.counter_cnt + j] = -1;
 	}
 
 	/* determine randomized spread-out "plan" for attaching to timers to
@@ -2438,27 +2534,33 @@ int main(int argc, char **argv)
 		perf_timer_fds[cpu] = pefd;
 
 		/* CPU cycles perf event, if supported */
-		memset(&attr, 0, sizeof(attr));
-		attr.size = sizeof(attr);
-		attr.type = PERF_TYPE_HARDWARE;
-		attr.config = PERF_COUNT_HW_CPU_CYCLES;
+		/* set up requested perf counters */
+		for (int j = 0; j < env.counter_cnt; j++) {
+			const struct perf_counter_def *def = &perf_counter_defs[env.counter_ids[j]];
+			int pe_idx = cpu * env.counter_cnt + j;
 
-		pefd = perf_event_open(&attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
-		if (pefd < 0) {
-			fprintf(stderr, "Failed to create CPU cycles PMU for CPU #%d, skipping...\n", cpu);
-		} else {
-			perf_counter_fds[cpu] = pefd;
-			err = bpf_map__update_elem(skel->maps.perf_cntrs,
-						   &cpu, sizeof(cpu),
-						   &pefd, sizeof(pefd), 0);
-			if (err) {
-				fprintf(stderr, "Failed to set up cpu-cycles PMU on CPU#%d for BPF: %d\n", cpu, err);
-				goto cleanup;
-			}
-			err = ioctl(pefd, PERF_EVENT_IOC_ENABLE, 0);
-			if (err) {
-				fprintf(stderr, "Failed to enable cpu-cycles PMU on CPU#%d: %d\n", cpu, err);
-				goto cleanup;
+			memset(&attr, 0, sizeof(attr));
+			attr.size = sizeof(attr);
+			attr.type = def->perf_type;
+			attr.config = def->perf_cfg;
+
+			pefd = perf_event_open(&attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+			if (pefd < 0) {
+				fprintf(stderr, "Failed to create %s PMU for CPU #%d, skipping...\n", def->alias, cpu);
+			} else {
+				perf_counter_fds[pe_idx] = pefd;
+				err = bpf_map__update_elem(skel->maps.perf_cntrs,
+							   &pe_idx, sizeof(pe_idx),
+							   &pefd, sizeof(pefd), 0);
+				if (err) {
+					fprintf(stderr, "Failed to set up %s PMU on CPU#%d for BPF: %d\n", def->alias, cpu, err);
+					goto cleanup;
+				}
+				err = ioctl(pefd, PERF_EVENT_IOC_ENABLE, 0);
+				if (err) {
+					fprintf(stderr, "Failed to enable %s PMU on CPU#%d: %d\n", def->alias, cpu, err);
+					goto cleanup;
+				}
 			}
 		}
 	}
@@ -2547,6 +2649,8 @@ cleanup:
 		for (i = 0; i < num_cpus; i++) {
 			if (perf_timer_fds[i] >= 0)
 				close(perf_timer_fds[i]);
+		}
+		for (i = 0; i < perf_counter_fd_cnt; i++) {
 			if (perf_counter_fds[i] >= 0) {
 				(void)ioctl(perf_counter_fds[i], PERF_EVENT_IOC_DISABLE, 0);
 				close(perf_counter_fds[i]);

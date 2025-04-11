@@ -17,6 +17,8 @@
 #define MAX_STACK_DEPTH 128
 #endif
 
+#define MAX_PERF_COUNTERS 6
+
 #ifndef PF_WQ_WORKER
 #define PF_WQ_WORKER 0x00000020
 #endif
@@ -66,6 +68,10 @@ struct wprof_task {
 	char pcomm[TASK_COMM_LEN];
 };
 
+struct perf_counters {
+	__u64 val[MAX_PERF_COUNTERS];
+};
+
 enum waking_flags {
 	WF_UNKNOWN,
 	WF_AWOKEN,
@@ -80,25 +86,27 @@ struct wprof_event {
 	struct wprof_task task;
 
 	union {
+		/*
 		struct wprof_switch {
 			struct wprof_task prev;
 			struct wprof_task waking;
 			__u64 waking_ts;
 			__u32 waking_cpu;
 			enum waking_flags waking_flags;
-			__u64 cpu_cycles;
+			//__u64 cpu_cycles;
 		} swtch;
+		*/
 		struct wprof_switch_from {
 			struct wprof_task next;
-			__u64 cpu_cycles;
+			struct perf_counters ctrs;
 		} swtch_from;
 		struct wprof_switch_to {
 			struct wprof_task prev;
-			__u64 cpu_cycles;
 			struct wprof_task waking;
 			__u64 waking_ts;
 			__u32 waking_cpu;
 			enum waking_flags waking_flags;
+			struct perf_counters ctrs;
 		} swtch_to;
 		struct wprof_timer {
 		} timer;
@@ -106,14 +114,17 @@ struct wprof_event {
 			__u64 hardirq_ts;
 			int irq;
 			char name[WORKER_DESC_LEN + TASK_COMM_LEN];
+			struct perf_counters ctrs;
 		} hardirq;
 		struct wprof_softirq {
 			__u64 softirq_ts;
 			int vec_nr;
+			struct perf_counters ctrs;
 		} softirq;
 		struct wprof_wq_info {
 			__u64 wq_ts;
 			char desc[WORKER_DESC_LEN];
+			struct perf_counters ctrs;
 		} wq;
 		struct wprof_task_rename {
 			char new_comm[TASK_COMM_LEN];

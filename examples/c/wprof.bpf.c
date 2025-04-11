@@ -19,11 +19,13 @@ struct task_state {
 	__u32 waking_flags;
 	struct wprof_task waking_task;
 	enum task_status status;
-	__u64 cpu_cycles;
 	__u64 softirq_ts;
 	__u64 hardirq_ts;
 	__u64 wq_ts;
 	char wq_name[WORKER_DESC_LEN];
+	struct perf_counters hardirq_ctrs;
+	struct perf_counters softirq_ctrs;
+	struct perf_counters wq_ctrs;
 };
 
 struct {
@@ -71,7 +73,7 @@ char comms[16][1] SEC(".data.comms");
 const volatile bool cpu_filter;
 __u64 cpus[512] SEC(".data.cpus"); /* CPU bitmask, up to 4096 CPUs are supported */
 
-const volatile bool cpu_counters;
+const volatile __u32 perf_ctr_cnt;
 
 __u64 session_start_ts;
 
@@ -235,6 +237,23 @@ static void submit_event(struct wprof_event *e)
 	bpf_ringbuf_submit(e, flags);
 }
 
+static void capture_perf_counters(struct perf_counters *c, int cpu)
+{
+	struct bpf_perf_event_value perf_val;
+
+	for (__u64 i = 0; i < perf_ctr_cnt; i++) {
+		int idx = cpu * perf_ctr_cnt + i, err;
+
+		err = bpf_perf_event_read_value(&perf_cntrs, idx, &perf_val, sizeof(perf_val));
+		if (err) {
+			bpf_printk("Failed to read perf counter #%d for #%d: %d", err, i, cpu);
+			c->val[i] = 0;
+		} else {
+			c->val[i] = perf_val.counter;
+		}
+	}
+}
+
 SEC("perf_event")
 int wprof_timer_tick(void *ctx)
 {
@@ -278,7 +297,9 @@ int BPF_PROG(wprof_task_switch,
 {
 	struct task_state *sprev, *snext;
 	struct wprof_event *e;
-	u64 now_ts, prev_dur_ns, next_dur_ns, waking_ts, cpu_cycles = 0;
+	u64 now_ts, prev_dur_ns, next_dur_ns, waking_ts;
+	int cpu = bpf_get_smp_processor_id();
+	struct perf_counters counters;
 
 	if (!should_trace(prev, next))
 		return 0;
@@ -292,17 +313,8 @@ int BPF_PROG(wprof_task_switch,
 
 	waking_ts = snext->waking_ts;
 
-	if (cpu_counters) {
-		struct bpf_perf_event_value perf_val;
-		int err;
-
-		err = bpf_perf_event_read_value(&perf_cntrs, BPF_F_CURRENT_CPU, &perf_val, sizeof(perf_val));
-		if (err) {
-			bpf_printk("Failed to read perf counter: %d", err);
-		} else {
-			cpu_cycles = perf_val.counter;
-		}
-	}
+	if (perf_ctr_cnt)
+		capture_perf_counters(&counters, cpu);
 
 	/* prev task was on-cpu since last checkpoint */
 	prev_dur_ns = now_ts - (sprev->ts ?: session_start_ts);
@@ -314,7 +326,7 @@ int BPF_PROG(wprof_task_switch,
 	 */
 	if (prev->__state == TASK_RUNNING && prev->pid) {
 		sprev->waking_ts = now_ts;
-		sprev->waking_cpu = bpf_get_smp_processor_id();
+		sprev->waking_cpu = cpu;
 		sprev->waking_flags = WF_PREEMPTED;
 		fill_task_info(next, &sprev->waking_task);
 	}
@@ -337,13 +349,13 @@ int BPF_PROG(wprof_task_switch,
 	*/
 
 	if ((e = prep_task_event(EV_SZ(swtch_from), EV_SWITCH_FROM, now_ts, prev))) {
-		e->swtch_from.cpu_cycles = cpu_cycles;
+		e->swtch_from.ctrs = counters;
 		fill_task_info(next, &e->swtch_from.next);
 		submit_event(e);
 	}
 
 	if ((e = prep_task_event(EV_SZ(swtch_to), EV_SWITCH_TO, now_ts, next))) {
-		e->swtch_to.cpu_cycles = cpu_cycles;
+		e->swtch_to.ctrs = counters;
 		fill_task_info(prev, &e->swtch_to.prev);
 		e->swtch_to.waking_ts = waking_ts;
 		if (waking_ts) {
@@ -558,14 +570,18 @@ static int handle_hardirq(struct task_struct *task, struct irqaction *action, in
 	struct task_state *s;
 	struct wprof_event *e;
 	u64 now_ts;
+	int cpu;
 	
 	s = task_state(task->pid);
 	if (!s)
 		return 0;
 
+	cpu = bpf_get_smp_processor_id();
 	now_ts = bpf_ktime_get_ns();
 	if (start) {
 		s->hardirq_ts = now_ts;
+		if (perf_ctr_cnt)
+			capture_perf_counters(&s->hardirq_ctrs, cpu);
 		return 0;
 	}
 
@@ -577,6 +593,15 @@ static int handle_hardirq(struct task_struct *task, struct irqaction *action, in
 		e->hardirq.hardirq_ts = s->hardirq_ts;
 		e->hardirq.irq = irq;
 		bpf_probe_read_kernel_str(&e->hardirq.name, sizeof(e->hardirq.name), action->name);
+
+		if (perf_ctr_cnt) {
+			struct perf_counters ctrs;
+
+			capture_perf_counters(&ctrs, cpu);
+			for (__u64 i = 0; i < perf_ctr_cnt; i++)
+				e->hardirq.ctrs.val[i] = ctrs.val[i] - s->hardirq_ctrs.val[i];
+		}
+
 		submit_event(e);
 	}
 
@@ -612,14 +637,18 @@ static int handle_softirq(struct task_struct *task, int vec_nr, bool start)
 	struct task_state *s;
 	struct wprof_event *e;
 	u64 now_ts;
+	int cpu;
 	
 	s = task_state(task->pid);
 	if (!s)
 		return 0;
 
+	cpu = bpf_get_smp_processor_id();
 	now_ts = bpf_ktime_get_ns();
 	if (start) {
 		s->softirq_ts = now_ts;
+		if (perf_ctr_cnt)
+			capture_perf_counters(&s->softirq_ctrs, cpu);
 		return 0;
 	}
 
@@ -629,6 +658,15 @@ static int handle_softirq(struct task_struct *task, int vec_nr, bool start)
 	if ((e = prep_task_event(EV_SZ(softirq), EV_SOFTIRQ_EXIT, now_ts, task))) {
 		e->softirq.softirq_ts = s->softirq_ts;
 		e->softirq.vec_nr = vec_nr;
+
+		if (perf_ctr_cnt) {
+			struct perf_counters ctrs;
+
+			capture_perf_counters(&ctrs, cpu);
+			for (__u64 i = 0; i < perf_ctr_cnt; i++)
+				e->softirq.ctrs.val[i] = ctrs.val[i] - s->softirq_ctrs.val[i];
+		}
+
 		submit_event(e);
 	}
 
@@ -679,12 +717,13 @@ static int handle_workqueue(struct task_struct *task, struct work_struct *work, 
 	struct task_state *s;
 	struct wprof_event *e;
 	u64 now_ts;
-	int err;
+	int cpu, err;
 
 	s = task_state(task->pid);
 	if (!s)
 		return 0;
 
+	cpu = bpf_get_smp_processor_id();
 	now_ts = bpf_ktime_get_ns();
 	if (start) {
 		struct kthread *k = bpf_core_cast(task->worker_private, struct kthread);
@@ -699,6 +738,9 @@ static int handle_workqueue(struct task_struct *task, struct work_struct *work, 
 			s->wq_name[2] = '?';
 			s->wq_name[3] = '\0';
 		}
+
+		if (perf_ctr_cnt)
+			capture_perf_counters(&s->wq_ctrs, cpu);
 		return 0;
 	}
 
@@ -708,6 +750,15 @@ static int handle_workqueue(struct task_struct *task, struct work_struct *work, 
 	if ((e = prep_task_event(EV_SZ(wq), EV_WQ_END, now_ts, task))) {
 		e->wq.wq_ts = s->wq_ts;
 		__builtin_memcpy(e->wq.desc, s->wq_name, sizeof(e->wq.desc));
+
+		if (perf_ctr_cnt) {
+			struct perf_counters ctrs;
+
+			capture_perf_counters(&ctrs, cpu);
+			for (__u64 i = 0; i < perf_ctr_cnt; i++)
+				e->wq.ctrs.val[i] = ctrs.val[i] - s->wq_ctrs.val[i];
+		}
+
 		submit_event(e);
 	}
 
