@@ -40,8 +40,6 @@ enum task_status {
 };
 
 enum event_kind {
-	EV_ON_CPU,
-	EV_OFF_CPU,
 	EV_TIMER,
 	EV_SWITCH_FROM,
 	EV_SWITCH_TO,
@@ -86,16 +84,6 @@ struct wprof_event {
 	struct wprof_task task;
 
 	union {
-		/*
-		struct wprof_switch {
-			struct wprof_task prev;
-			struct wprof_task waking;
-			__u64 waking_ts;
-			__u32 waking_cpu;
-			enum waking_flags waking_flags;
-			//__u64 cpu_cycles;
-		} swtch;
-		*/
 		struct wprof_switch_from {
 			struct wprof_task next;
 			struct perf_counters ctrs;
@@ -137,15 +125,6 @@ struct wprof_event {
 			char filename[WORKER_DESC_LEN - 4];
 		} exec;
 	};
-
-	/* DO NOT PUT ANYTHING HERE */
-
-	/*
-	__s32 kstack_sz;
-	__s32 ustack_sz;
-	stack_trace_t kstack;
-	stack_trace_t ustack;
-	*/
 };
 
 #ifndef offsetofend

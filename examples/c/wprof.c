@@ -1115,9 +1115,6 @@ struct task_state {
 	/* task renames */
 	__u64 rename_ts;
 	char old_comm[TASK_COMM_FULL_LEN];
-	/* periodic stats */
-	uint64_t on_cpu_ns;
-	uint64_t off_cpu_ns;
 	/* perf counters */
 	__u64 oncpu_ts;
 	struct perf_counters oncpu_ctrs;
@@ -1139,35 +1136,10 @@ static volatile bool exiting;
 
 static void sig_timer(int sig)
 {
-	struct hashmap_entry *cur, *tmp;
-	int bkt;
-	struct task_state *st;
-
 	if (env.run_dur_ms) {
 		exiting = true;
 		return;
 	}
-
-	printf("===============================\n");
-	hashmap__for_each_entry_safe(tasks, cur, tmp, bkt) {
-		st = cur->pvalue;
-
-		if (st->on_cpu_ns + st->off_cpu_ns == 0)
-			continue;
-
-		if (cur->key < 0) {
-			printf("IDLE #%ld: ONCPU = %.3lfms OFFCPU = %.3lfms\n",
-			       -cur->key - 1, st->on_cpu_ns / 1000000.0, st->off_cpu_ns / 1000000.0);
-		} else {
-			printf("%s (%d/%d): ONCPU = %.3lfms OFFCPU = %.3lfms\n",
-			       st->comm, st->tid, st->pid,
-			       st->on_cpu_ns / 1000000.0, st->off_cpu_ns / 1000000.0);
-		}
-
-		st->on_cpu_ns = 0;
-		st->off_cpu_ns = 0;
-	}
-	printf("-------------------------------\n");
 }
 
 static void sig_term(int sig)
@@ -1356,8 +1328,6 @@ static uint64_t process_track_uuid(const struct wprof_task *t)
 }
 
 static const char *event_kind_str_map[] = {
-	[EV_ON_CPU] = "ON_CPU",
-	[EV_OFF_CPU] = "OFF_CPU",
 	[EV_TIMER] = "TIMER",
 	[EV_SWITCH_FROM] = "SWITCH_FROM",
 	[EV_SWITCH_TO] = "SWITCH_TO",
@@ -1795,14 +1765,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 	st = task_state(w, &e->task);
 
 	switch (e->kind) {
-	case EV_ON_CPU:
-		//st->on_cpu_ns += e->dur_ns;
-		break;
-	case EV_OFF_CPU:
-		//st->off_cpu_ns += e->dur_ns;
-		break;
 	case EV_TIMER:
-		//st->on_cpu_ns += e->dur_ns;
 		break;
 	case EV_SWITCH_FROM:
 		nst = task_state(w, &e->swtch_from.next);
@@ -1838,14 +1801,6 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 
 	if (w->trace) {
 		switch (e->kind) {
-		case EV_ON_CPU:
-			/* task finished running on CPU */
-			//emit_trace_slice_point(e, e.task.comm, NULL, "ON_CPU", false /* !start */);
-			break;
-		case EV_OFF_CPU:
-			/* task starting to run on CPU */
-			//emit_trace_slice_point(e, e.task.comm, NULL, "ON_CPU", true /* start */);
-			break;
 		case EV_TIMER:
 			/* task keeps running on CPU */
 			emit_instant(e->ts, &e->task, IID_NAME_TIMER, "TIMER") {

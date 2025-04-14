@@ -336,18 +336,6 @@ int BPF_PROG(wprof_task_switch,
 	snext->ts = now_ts;
 	snext->waking_ts = 0;
 
-	/*
-	if ((e = prep_task_event(EV_ON_CPU, now_ts, prev))) {
-		//e->dur_ns = prev_dur_ns;
-		submit_event(e);
-	}
-
-	if ((e = prep_task_event(EV_OFF_CPU, now_ts, next))) {
-		//e->dur_ns = next_dur_ns;
-		submit_event(e);
-	}
-	*/
-
 	if ((e = prep_task_event(EV_SZ(swtch_from), EV_SWITCH_FROM, now_ts, prev))) {
 		e->swtch_from.ctrs = counters;
 		fill_task_info(next, &e->swtch_from.next);
@@ -518,7 +506,6 @@ int BPF_PROG(wprof_task_exit, struct task_struct *p)
 {
 	struct task_state *s;
 	struct wprof_event *e;
-	//enum event_kind kind;
 	u64 now_ts;
 	int id;
 
@@ -530,20 +517,12 @@ int BPF_PROG(wprof_task_exit, struct task_struct *p)
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	//kind = s->status == STATUS_ON_CPU ? EV_ON_CPU : EV_OFF_CPU;
 	
-	task_state_delete(p->pid);
-
-	/*
-	if ((e = prep_task_event(kind, now_ts, p))) {
-		//e->dur_ns = now_ts - s->ts;
-		submit_event(e);
-	}
-	*/
-
 	if ((e = prep_task_event(EV_SZ(task), EV_TASK_EXIT, now_ts, p))) {
 		submit_event(e);
 	}
+
+	task_state_delete(p->pid);
 
 	return 0;
 }
