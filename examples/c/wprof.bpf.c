@@ -7,6 +7,9 @@
 
 #include "wprof.h"
 
+#define E2BIG		7
+#define ENODATA		61
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 #define __cleanup(callback) __attribute__((cleanup(callback)))
@@ -192,7 +195,8 @@ struct rb_ctx {
 	u64 has_dptr;
 };
 
-static __always_inline struct rb_ctx __rb_event_reserve(struct task_struct *p, __u64 fix_sz, __u64 dyn_sz, void **ev_out)
+static __always_inline struct rb_ctx __rb_event_reserve(struct task_struct *p, __u64 fix_sz, __u64 dyn_sz,
+							void **ev_out, struct bpf_dynptr **dptr)
 {
 	struct rb_ctx rb_ctx = {};
 	struct wprof_event *e;
@@ -212,6 +216,8 @@ static __always_inline struct rb_ctx __rb_event_reserve(struct task_struct *p, _
 		(void)inc_stat(rb_drops);
 
 	*ev_out = rb_ctx.ev = bpf_dynptr_data(&rb_ctx.dptr, 0, fix_sz);
+	if (dptr)
+		*dptr = &rb_ctx.dptr;
 
 	return rb_ctx;
 }
@@ -228,53 +234,6 @@ static void __rb_event_submit(void *arg)
 
 	/* no-op, if ctx->rb is NULL */
 	bpf_ringbuf_submit_dynptr(&ctx->dptr, flags);
-}
-
-static struct wprof_event *prep_task_event(__u64 sz, enum event_kind kind, u64 now_ts, struct task_struct *p)
-{
-	struct wprof_event *e;
-	void *rb;
-	__u32 cpu = bpf_get_smp_processor_id();
-	__u32 rb_slot = calc_rb_slot(p->pid, cpu);
-	long queued_sz;
-
-	rb = bpf_map_lookup_elem(&rbs, &rb_slot);
-	if (!rb) {
-		(void)inc_stat(rb_misses);
-		return NULL;
-	}
-
-	e = bpf_ringbuf_reserve(rb, sz, 0);
-	if (!e) {
-		(void)inc_stat(rb_drops);
-		return NULL;
-	}
-
-	e->kind = kind;
-	e->ts = now_ts;
-	e->cpu_id = cpu;
-	fill_task_info(p, &e->task);
-
-	queued_sz = bpf_ringbuf_query(rb, BPF_RB_AVAIL_DATA);
-	/* XXX: make this tunable from user space */
-	if (queued_sz >= 256 * 1024)
-		e->kind = -e->kind; /* mark that we should force ringbuf notification on submit */
-
-	return e;
-}
-
-static void submit_event(struct wprof_event *e)
-{
-	long flags = BPF_RB_NO_WAKEUP;
-
-	if ((int)e->kind < 0) {
-		flags = BPF_RB_FORCE_WAKEUP;
-		e->kind = -e->kind;
-	} else {
-		flags = BPF_RB_NO_WAKEUP;
-	}
-
-	bpf_ringbuf_submit(e, flags);
 }
 
 static void capture_perf_counters(struct perf_counters *c, int cpu)
@@ -298,49 +257,70 @@ static void __capture_stack_trace(void *ctx, struct stack_trace *st)
 {
 	__u64 off = zero;
 
-	st->kern_sz = bpf_get_stack(ctx, st->addrs, sizeof(st->addrs) / 2, 0);
-	if (st->kern_sz > 0)
-		off += st->kern_sz;
+	st->kstack_sz = bpf_get_stack(ctx, st->addrs, sizeof(st->addrs) / 2, 0);
+	if (st->kstack_sz > 0)
+		off += st->kstack_sz;
 
 	if (off > sizeof(st->addrs) / 2) /* impossible */
 		off = sizeof(st->addrs) / 2;
 
-	st->user_sz = bpf_get_stack(ctx, st->addrs, sizeof(st->addrs) / 2, BPF_F_USER_STACK);
+	st->ustack_sz = bpf_get_stack(ctx, (void *)st->addrs + off, sizeof(st->addrs) / 2, BPF_F_USER_STACK);
 }
 
-static struct stack_trace *capture_stack_trace(void *ctx)
+static struct stack_trace *grab_stack_trace(void *ctx, size_t *sz)
 {
 	struct stack_trace *st;
 
 	st = bpf_map_lookup_elem(&stack_trace_scratch, &zero);
 	if (!st)
-		return NULL; /* shouldn't happen */
+		return *sz = 0, NULL; /* shouldn't happen */
 
 	__capture_stack_trace(ctx, st);
+	*sz = (st->kstack_sz < 0 ? 0 : st->kstack_sz) +
+	      (st->ustack_sz < 0 ? 0 : st->ustack_sz) +
+	      offsetof(struct stack_trace, addrs);
 	return st;
 }
 
-static __always_inline bool init_wprof_event(struct wprof_event *e, enum event_kind kind, u64 ts, struct task_struct *p)
+static int emit_stack_trace(struct stack_trace *t, size_t sz, struct bpf_dynptr *dptr, size_t offset)
 {
+	if (sz == 0)
+		return -ENODATA;
+	barrier_var(sz);
+	if (sz > sizeof(*t))
+		return -E2BIG; /* shouldn't ever happen */
+	return bpf_dynptr_write(dptr, offset, t, sz, 0);
+}
+
+static __always_inline bool init_wprof_event(struct wprof_event *e, u32 sz, enum event_kind kind, u64 ts, struct task_struct *p)
+{
+	e->sz = sz;
+	e->flags = 0;
 	e->kind = kind;
 	e->ts = ts;
-	e->cpu_id = bpf_get_smp_processor_id();
+	e->cpu = bpf_get_smp_processor_id();
 	fill_task_info(p, &e->task);
 	return true; /* makes emit_task_event() macro a bit easier to write */
 }
 
 #define emit_task_event(e, fix_sz, dyn_sz, kind, ts, task)					\
 	for (struct rb_ctx __cleanup(__rb_event_submit) __ctx =					\
-			__rb_event_reserve(task, fix_sz, dyn_sz, (void **)&(e));		\
-	     e && __ctx.ev && init_wprof_event(e, kind, ts, task);				\
+			__rb_event_reserve(task, fix_sz, dyn_sz, (void **)&(e), NULL);		\
+	     e && __ctx.ev && init_wprof_event(e, fix_sz, kind, ts, task);			\
 	     __ctx.ev = NULL)
+
+#define emit_task_event_dyn(e, dptr, fix_sz, dyn_sz, kind, ts, task)				\
+	for (struct rb_ctx __cleanup(__rb_event_submit) __ctx =					\
+			__rb_event_reserve(task, fix_sz, dyn_sz, (void **)&(e), &(dptr));	\
+	     e && __ctx.ev && init_wprof_event(e, fix_sz, kind, ts, task);			\
+	     __ctx.ev = NULL)
+
 
 SEC("perf_event")
 int wprof_timer_tick(void *ctx)
 {
 	struct task_state *scur;
 	struct task_struct *cur = bpf_get_current_task_btf();
-	struct wprof_event *e;
 	u64 now_ts;
 
 	if (!should_trace(cur, NULL))
@@ -357,7 +337,18 @@ int wprof_timer_tick(void *ctx)
 		/* we don't know if we are in IRQ or not, but presume not */
 		scur->status = STATUS_ON_CPU;
 
-	emit_task_event(e, EV_SZ(timer), 0, EV_TIMER, now_ts, cur);
+	struct wprof_event *e;
+	struct bpf_dynptr *dptr;
+	struct stack_trace *strace = NULL;
+	size_t dyn_sz = 0;
+	size_t fix_sz = EV_SZ(timer);
+
+	if (capture_stack_traces)
+		strace = grab_stack_trace(ctx, &dyn_sz);
+
+	emit_task_event_dyn(e, dptr, fix_sz, dyn_sz, EV_TIMER, now_ts, cur) {
+		emit_stack_trace(strace, dyn_sz, dptr, fix_sz);
+	}
 out:
 	return 0;
 }

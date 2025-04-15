@@ -1752,41 +1752,38 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	w->rb_handled_cnt++;
 	w->rb_handled_sz += size;
-	
-	switch (e->kind) {
-	case EV_TIMER:
-		//fprintf(stderr, "KIND %d !!! SZ %zu ADDR 0x%lx\n", e->kind, size, (unsigned long)e);
-		break;
-	case EV_SWITCH_FROM:
-	case EV_SWITCH_TO:
-	case EV_FORK:
-	case EV_EXEC:
-	case EV_TASK_RENAME:
-	case EV_TASK_EXIT:
-	case EV_TASK_FREE:
-	case EV_WAKEUP:
-	case EV_WAKEUP_NEW:
-	case EV_WAKING:
-	case EV_HARDIRQ_EXIT:
-	case EV_SOFTIRQ_EXIT:
-	case EV_WQ_END:
-		break;
-	default:
-		fprintf(stderr, "HANDLE EVENT UNHANDLED EVENT %d SIZE %zd\n", e->kind, size);
-		exit(1);
-		break;
-	}
 
 	return 0;
 }
+
+static int stack_cnt;
 
 /* Receive events from the ring buffer. */
 static int process_event(struct worker_state *w, struct wprof_event *e, size_t size)
 {
 	const char *status;
 	struct task_state *st, *pst = NULL, *fst = NULL, *nst = NULL;
+	struct stack_trace *tr = NULL;
 
 	st = task_state(w, &e->task);
+
+	if (e->sz < size && stack_cnt++ < 100) {
+		tr = (void *)e + e->sz;
+		if (tr->kstack_sz > 0) {
+			printf("Kernel:\n");
+			show_stack_trace(tr->addrs, tr->kstack_sz / sizeof(__u64), 0);
+		} else {
+			printf("No Kernel Stack\n");
+		}
+
+		if (tr->ustack_sz > 0) {
+			printf("Userspace:\n");
+			show_stack_trace(tr->addrs + (tr->kstack_sz >= 0 ? tr->kstack_sz: 0) / 8,
+					 tr->ustack_sz / sizeof(__u64), e->task.pid);
+		} else {
+			printf("No Userspace Stack\n");
+		}
+	}
 
 	switch (e->kind) {
 	case EV_TIMER:
@@ -1828,7 +1825,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 		case EV_TIMER:
 			/* task keeps running on CPU */
 			emit_instant(e->ts, &e->task, IID_NAME_TIMER, "TIMER") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 			}
 			break;
 		case EV_SWITCH_FROM: {
@@ -1852,14 +1849,14 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 				emit_slice_point(env.sess_start_ts, &e->task,
 						 prev_name_iid, prev_name,
 						 IID_CAT_ONCPU, "ONCPU", true /*start*/) {
-					emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+					emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 				}
 			}
 
 			emit_slice_point(e->ts, &e->task,
 					 prev_name_iid, prev_name,
 					 IID_CAT_ONCPU, "ONCPU", false /*!start*/) {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 
 				emit_kv_str(IID_ANNK_SWITCH_TO, "switch_to", nst->name_iid, e->swtch_from.next.comm);
 				emit_kv_int(IID_ANNK_SWITCH_TO_TID, "switch_to_tid", task_tid(&e->swtch_from.next));
@@ -1916,18 +1913,18 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 				}
 
 				/* event on awoken's timeline */
-				if (e->swtch_to.waking_cpu != e->cpu_id) {
+				if (e->swtch_to.waking_cpu != e->cpu) {
 					emit_instant(e->swtch_to.waking_ts, &e->task,
 						     e->swtch_to.waking_flags == WF_AWOKEN_NEW ? IID_NAME_AWOKEN_NEW : IID_NAME_AWAKING,
 						     e->swtch_to.waking_flags == WF_AWOKEN_NEW ? "AWOKEN_NEW" : "AWAKING") {
-						emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+						emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 					}
 				}
 			}
 
 			emit_slice_point(e->ts, &e->task, st->name_iid, e->task.comm,
 					 IID_CAT_ONCPU, "ONCPU", true /*start*/) {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 
 				if (e->swtch_to.waking_ts) {
 					emit_kv_str(IID_ANNK_WAKING_BY, "waking_by", wst->name_iid, e->swtch_to.waking.comm);
@@ -1959,13 +1956,13 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 		}
 		case EV_FORK: {
 			emit_instant(e->ts, &e->task, IID_NAME_FORKING, "FORKING") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 				emit_kv_str(IID_ANNK_FORKED_INTO, "forked_into", fst->name_iid, e->fork.child.comm);
 				emit_kv_int(IID_ANNK_FORKED_INTO_TID, "forked_into_tid", task_tid(&e->fork.child));
 				emit_kv_int(IID_ANNK_FORKED_INTO_PID, "forked_into_pid", e->fork.child.pid);
 			}
 			emit_instant(e->ts, &e->fork.child, IID_NAME_FORKED, "FORKED") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 				emit_kv_str(IID_ANNK_FORKED_FROM, "forked_from", st->name_iid, e->task.comm);
 				emit_kv_int(IID_ANNK_FORKED_FROM_TID, "forked_from_tid", task_tid(&e->task));
 				emit_kv_int(IID_ANNK_FORKED_FROM_PID, "forked_from_pid", e->task.pid);
@@ -1974,7 +1971,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 		}
 		case EV_EXEC: {
 			emit_instant(e->ts, &e->task, IID_NAME_EXEC, "EXEC") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 				emit_kv_str(IID_ANNK_FILENAME, "filename", IID_NONE, e->exec.filename);
 				if (e->task.tid != e->exec.old_tid)
 					emit_kv_int(IID_ANNK_TID_CHANGED_FROM, "tid_changed_from", e->exec.old_tid);
@@ -1983,7 +1980,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 		}
 		case EV_TASK_RENAME: {
 			emit_instant(e->ts, &e->task, IID_NAME_RENAME, "RENAME") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 				emit_kv_str(IID_ANNK_OLD_NAME, "old_name", IID_NONE, e->task.comm);
 				emit_kv_str(IID_ANNK_NEW_NAME, "new_name", IID_NONE, e->rename.new_comm);
 			}
@@ -1994,34 +1991,34 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 		}
 		case EV_TASK_EXIT:
 			emit_instant(e->ts, &e->task, IID_NAME_EXIT, "EXIT") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 			}
 			break;
 		case EV_TASK_FREE:
 			emit_instant(e->ts, &e->task, IID_NAME_FREE, "FREE") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 			}
 			break;
 		case EV_WAKEUP:
 			emit_instant(e->ts, &e->task, IID_NAME_WAKEUP, "WAKEUP") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 			}
 			break;
 		case EV_WAKEUP_NEW:
 			emit_instant(e->ts, &e->task, IID_NAME_WAKEUP_NEW, "WAKEUP_NEW") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 			}
 			break;
 		case EV_WAKING:
 			emit_instant(e->ts, &e->task, IID_NAME_WAKING, "WAKING") {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 			}
 			break;
 		case EV_HARDIRQ_EXIT:
 			emit_slice_point(e->hardirq.hardirq_ts, &e->task,
 					 IID_NAME_HARDIRQ, "HARDIRQ",
 					 IID_CAT_HARDIRQ, "HARDIRQ", true /* start */) {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 				emit_kv_int(IID_ANNK_IRQ, "irq", e->hardirq.irq);
 				emit_kv_str(IID_ANNK_ACTION, "action", IID_NONE, e->hardirq.name);
 			}
@@ -2050,7 +2047,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 			emit_slice_point(e->softirq.softirq_ts, &e->task,
 					 name_iid, sfmt("%s:%s", "SOFTIRQ", softirq_str(e->softirq.vec_nr)),
 					 IID_CAT_SOFTIRQ, "SOFTIRQ", true /* start */) {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 				emit_kv_str(IID_ANNK_ACTION, "action", act_iid, softirq_str(e->softirq.vec_nr));
 			}
 
@@ -2070,7 +2067,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 			emit_slice_point(e->wq.wq_ts, &e->task,
 					 IID_NONE, sfmt("%s:%s", "WQ", e->wq.desc),
 					 IID_CAT_WQ, "WQ", true /* start */) {
-				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu_id);
+				emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 				emit_kv_str(IID_ANNK_ACTION, "action", IID_NONE, e->wq.desc);
 			}
 			emit_slice_point(e->ts, &e->task,
@@ -2105,7 +2102,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 		return 0;
 
 	printf("%s (%d/%d) @ CPU %d %s %lldus\n",
-	       e->task.comm, e->task.tid, e->task.pid, e->cpu_id,
+	       e->task.comm, e->task.tid, e->task.pid, e->cpu,
 	       status, 0LL /* e->dur_ns / 1000 */);
 
 	/*

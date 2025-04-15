@@ -57,8 +57,8 @@ enum event_kind {
 };
 
 struct stack_trace {
-	int kern_sz;
-	int user_sz;;
+	int kstack_sz;
+	int ustack_sz;;
 	__u64 addrs[MAX_STACK_DEPTH * 2];
 };
 
@@ -81,9 +81,16 @@ enum waking_flags {
 	WF_PREEMPTED,
 };
 
+enum event_flags {
+	EF_NONE = 0x00,
+	//EF_STACK_TRACE = 0x01,
+};
+
 struct wprof_event {
+	__u32 sz; /* fixed part size */
+	__u32 flags;
 	enum event_kind kind;
-	__u32 cpu_id;
+	__u32 cpu;
 	__u64 ts;
 	struct wprof_task task;
 
