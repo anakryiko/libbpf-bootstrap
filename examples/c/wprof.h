@@ -56,7 +56,11 @@ enum event_kind {
 	EV_TASK_FREE,
 };
 
-typedef __u64 stack_trace_t[MAX_STACK_DEPTH];
+struct stack_trace {
+	int kern_sz;
+	int user_sz;;
+	__u64 addrs[MAX_STACK_DEPTH * 2];
+};
 
 struct wprof_task {
 	__u32 tid;

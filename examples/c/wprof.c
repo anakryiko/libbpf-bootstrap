@@ -1752,6 +1752,30 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	w->rb_handled_cnt++;
 	w->rb_handled_sz += size;
+	
+	switch (e->kind) {
+	case EV_TIMER:
+		//fprintf(stderr, "KIND %d !!! SZ %zu ADDR 0x%lx\n", e->kind, size, (unsigned long)e);
+		break;
+	case EV_SWITCH_FROM:
+	case EV_SWITCH_TO:
+	case EV_FORK:
+	case EV_EXEC:
+	case EV_TASK_RENAME:
+	case EV_TASK_EXIT:
+	case EV_TASK_FREE:
+	case EV_WAKEUP:
+	case EV_WAKEUP_NEW:
+	case EV_WAKING:
+	case EV_HARDIRQ_EXIT:
+	case EV_SOFTIRQ_EXIT:
+	case EV_WQ_END:
+		break;
+	default:
+		fprintf(stderr, "HANDLE EVENT UNHANDLED EVENT %d SIZE %zd\n", e->kind, size);
+		exit(1);
+		break;
+	}
 
 	return 0;
 }
@@ -2169,10 +2193,12 @@ static void print_exit_summary(struct wprof_bpf *skel, int num_cpus, int exit_co
 	__u64 rb_handled_cnt = 0, rb_ignored_cnt = 0;
 	__u64 rb_handled_sz = 0, rb_ignored_sz = 0;
 
-	rb_handled_cnt += worker->rb_handled_cnt;
-	rb_handled_sz += worker->rb_handled_sz;
-	rb_ignored_cnt += worker->rb_ignored_cnt;
-	rb_ignored_sz += worker->rb_ignored_sz;
+	if (worker) {
+		rb_handled_cnt += worker->rb_handled_cnt;
+		rb_handled_sz += worker->rb_handled_sz;
+		rb_ignored_cnt += worker->rb_ignored_cnt;
+		rb_ignored_sz += worker->rb_ignored_sz;
+	}
 
 	if (!skel)
 		goto skip_prog_stats;

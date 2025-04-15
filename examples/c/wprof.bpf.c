@@ -9,6 +9,8 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+#define __cleanup(callback) __attribute__((cleanup(callback)))
+
 #define TASK_RUNNING 0
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
@@ -40,6 +42,13 @@ struct {
 	__type(value, struct wprof_stats);
 	__uint(max_entries, 1);
 } stats SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct stack_trace);
+	__uint(max_entries, 1);
+} stack_trace_scratch SEC(".maps");
 
 #define inc_stat(stat) ({							\
 	__u64 __s = 0;								\
@@ -73,15 +82,17 @@ char comms[16][1] SEC(".data.comms");
 const volatile bool cpu_filter;
 __u64 cpus[512] SEC(".data.cpus"); /* CPU bitmask, up to 4096 CPUs are supported */
 
-const volatile __u32 perf_ctr_cnt;
-
-__u64 session_start_ts;
+const volatile __u32 perf_ctr_cnt = 1; /* for veristat, reset in user space */
 
 const volatile __u64 rb_cnt_bits;
 
-const volatile int zero = 0;
 
+const volatile bool capture_stack_traces = true;
+
+static int zero = 0;
 static struct task_state empty_task_state;
+
+__u64 session_start_ts;
 
 /* XXX: pass CPU explicitly to avoid unnecessary surprises */
 static __always_inline int task_id(int pid)
@@ -138,14 +149,7 @@ static bool should_trace(struct task_struct *task1, struct task_struct *task2)
 
 static void fill_task_name(struct task_struct *t, char *comm, int max_len)
 {
-	if (t->flags & PF_WQ_WORKER) {
-		//struct kthread *k = bpf_core_cast(t->worker_private, struct kthread);
-		//struct worker *worker = bpf_core_cast(k->data, struct worker);
-
-		/* TODO: prepend "kworker/..." parts */
-		//bpf_probe_read_kernel_str(comm, WORKER_DESC_LEN, worker->desc);
-		__builtin_memcpy(comm, t->comm, TASK_COMM_LEN);
-	} else if (t->flags & PF_KTHREAD) {
+	if (t->flags & PF_KTHREAD) {
 		struct kthread *k = bpf_core_cast(t->worker_private, struct kthread);
 		int err = -1;
 
@@ -181,6 +185,51 @@ static __always_inline __u32 calc_rb_slot(int pid, int cpu)
 	return hash_bits(pid ?: cpu, rb_cnt_bits);
 }
 
+struct rb_ctx {
+	void *rb;
+	void *ev;
+	struct bpf_dynptr dptr;
+	u64 has_dptr;
+};
+
+static __always_inline struct rb_ctx __rb_event_reserve(struct task_struct *p, __u64 fix_sz, __u64 dyn_sz, void **ev_out)
+{
+	struct rb_ctx rb_ctx = {};
+	struct wprof_event *e;
+	void *rb;
+	__u32 cpu = bpf_get_smp_processor_id();
+	__u32 rb_slot = calc_rb_slot(p->pid, cpu);
+
+	rb = bpf_map_lookup_elem(&rbs, &rb_slot);
+	if (!rb) {
+		(void)inc_stat(rb_misses);
+		return rb_ctx;
+	}
+	rb_ctx.rb = rb;
+	rb_ctx.has_dptr = true;
+
+	if (bpf_ringbuf_reserve_dynptr(rb, fix_sz + dyn_sz, 0, &rb_ctx.dptr))
+		(void)inc_stat(rb_drops);
+
+	*ev_out = rb_ctx.ev = bpf_dynptr_data(&rb_ctx.dptr, 0, fix_sz);
+
+	return rb_ctx;
+}
+
+static void __rb_event_submit(void *arg)
+{
+	struct rb_ctx *ctx = arg;
+
+	if (!ctx->has_dptr)
+		return;
+
+	long queued_sz = bpf_ringbuf_query(ctx->rb, BPF_RB_AVAIL_DATA);
+	long flags = queued_sz >= 256 * 1024 ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
+
+	/* no-op, if ctx->rb is NULL */
+	bpf_ringbuf_submit_dynptr(&ctx->dptr, flags);
+}
+
 static struct wprof_event *prep_task_event(__u64 sz, enum event_kind kind, u64 now_ts, struct task_struct *p)
 {
 	struct wprof_event *e;
@@ -206,17 +255,8 @@ static struct wprof_event *prep_task_event(__u64 sz, enum event_kind kind, u64 n
 	e->cpu_id = cpu;
 	fill_task_info(p, &e->task);
 
-	/*
-	e->kstack_sz = 0;
-	e->ustack_sz = 0;
-
-	event->kstack_sz = bpf_get_stack(ctx, event->kstack, sizeof(event->kstack), 0);
-
-	event->ustack_sz =
-		bpf_get_stack(ctx, event->ustack, sizeof(event->ustack), BPF_F_USER_STACK);
-	*/
-
 	queued_sz = bpf_ringbuf_query(rb, BPF_RB_AVAIL_DATA);
+	/* XXX: make this tunable from user space */
 	if (queued_sz >= 256 * 1024)
 		e->kind = -e->kind; /* mark that we should force ringbuf notification on submit */
 
@@ -254,13 +294,54 @@ static void capture_perf_counters(struct perf_counters *c, int cpu)
 	}
 }
 
+static void __capture_stack_trace(void *ctx, struct stack_trace *st)
+{
+	__u64 off = zero;
+
+	st->kern_sz = bpf_get_stack(ctx, st->addrs, sizeof(st->addrs) / 2, 0);
+	if (st->kern_sz > 0)
+		off += st->kern_sz;
+
+	if (off > sizeof(st->addrs) / 2) /* impossible */
+		off = sizeof(st->addrs) / 2;
+
+	st->user_sz = bpf_get_stack(ctx, st->addrs, sizeof(st->addrs) / 2, BPF_F_USER_STACK);
+}
+
+static struct stack_trace *capture_stack_trace(void *ctx)
+{
+	struct stack_trace *st;
+
+	st = bpf_map_lookup_elem(&stack_trace_scratch, &zero);
+	if (!st)
+		return NULL; /* shouldn't happen */
+
+	__capture_stack_trace(ctx, st);
+	return st;
+}
+
+static __always_inline bool init_wprof_event(struct wprof_event *e, enum event_kind kind, u64 ts, struct task_struct *p)
+{
+	e->kind = kind;
+	e->ts = ts;
+	e->cpu_id = bpf_get_smp_processor_id();
+	fill_task_info(p, &e->task);
+	return true; /* makes emit_task_event() macro a bit easier to write */
+}
+
+#define emit_task_event(e, fix_sz, dyn_sz, kind, ts, task)					\
+	for (struct rb_ctx __cleanup(__rb_event_submit) __ctx =					\
+			__rb_event_reserve(task, fix_sz, dyn_sz, (void **)&(e));		\
+	     e && __ctx.ev && init_wprof_event(e, kind, ts, task);				\
+	     __ctx.ev = NULL)
+
 SEC("perf_event")
 int wprof_timer_tick(void *ctx)
 {
 	struct task_state *scur;
 	struct task_struct *cur = bpf_get_current_task_btf();
 	struct wprof_event *e;
-	u64 now_ts, dur_ns;
+	u64 now_ts;
 
 	if (!should_trace(cur, NULL))
 		return false;
@@ -271,19 +352,12 @@ int wprof_timer_tick(void *ctx)
 
 	now_ts = bpf_ktime_get_ns();
 
-	/* cur task was on-cpu since last checkpoint */
-	dur_ns = now_ts - (scur->ts ?: session_start_ts);
-
 	scur->ts = now_ts;
 	if (scur->status == STATUS_UNKNOWN)
 		/* we don't know if we are in IRQ or not, but presume not */
 		scur->status = STATUS_ON_CPU;
 
-	if ((e = prep_task_event(EV_SZ(timer), EV_TIMER, now_ts, cur))) {
-		//e->dur_ns = dur_ns;
-		submit_event(e);
-	}
-
+	emit_task_event(e, EV_SZ(timer), 0, EV_TIMER, now_ts, cur);
 out:
 	return 0;
 }
@@ -336,13 +410,13 @@ int BPF_PROG(wprof_task_switch,
 	snext->ts = now_ts;
 	snext->waking_ts = 0;
 
-	if ((e = prep_task_event(EV_SZ(swtch_from), EV_SWITCH_FROM, now_ts, prev))) {
+
+	emit_task_event(e, EV_SZ(swtch_from), 0, EV_SWITCH_FROM, now_ts, prev) {
 		e->swtch_from.ctrs = counters;
 		fill_task_info(next, &e->swtch_from.next);
-		submit_event(e);
 	}
 
-	if ((e = prep_task_event(EV_SZ(swtch_to), EV_SWITCH_TO, now_ts, next))) {
+	emit_task_event(e, EV_SZ(swtch_to), 0, EV_SWITCH_TO, now_ts, next) {
 		e->swtch_to.ctrs = counters;
 		fill_task_info(prev, &e->swtch_to.prev);
 		e->swtch_to.waking_ts = waking_ts;
@@ -352,7 +426,6 @@ int BPF_PROG(wprof_task_switch,
 			bpf_probe_read_kernel(&e->swtch_to.waking, sizeof(snext->waking_task),
 					      &snext->waking_task);
 		}
-		submit_event(e);
 	}
 
 	return 0;
@@ -381,9 +454,7 @@ int BPF_PROG(wprof_task_waking, struct task_struct *p)
 	fill_task_info(task, &s->waking_task);
 
 	/*
-	if ((e = prep_task_event(EV_SZ(task), EV_WAKING, now_ts, p))) {
-		submit_event(e);
-	}
+	emit_task_event(e, EV_SZ(task), 0, EV_WAKING, now_ts, p);
 	*/
 
 	return 0;
@@ -416,9 +487,7 @@ int BPF_PROG(wprof_task_wakeup_new, struct task_struct *p)
 	s->status = STATUS_OFF_CPU;
 
 	/*
-	if ((e = prep_task_event(EV_SZ(task), EV_WAKEUP_NEW, now_ts, p))) {
-		submit_event(e);
-	}
+	emit_task_event(e, EV_SZ(task), 0, EV_WAKEUP_NEW, now_ts, p);
 	*/
 
 	return 0;
@@ -434,9 +503,7 @@ int BPF_PROG(wprof_task_wakeup, struct task_struct *p)
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_SZ(task), EV_WAKEUP, now_ts, p))) {
-		submit_event(e);
-	}
+	emit_task_event(e, EV_SZ(task), 0, EV_WAKEUP, now_ts, p);
 
 	return 0;
 }
@@ -455,9 +522,8 @@ int BPF_PROG(wprof_task_rename, struct task_struct *task, const char *comm)
 
 	now_ts = bpf_ktime_get_ns();
 
-	if ((e = prep_task_event(EV_SZ(rename), EV_TASK_RENAME, now_ts, task))) {
+	emit_task_event(e, EV_SZ(rename), 0, EV_TASK_RENAME, now_ts, task) {
 		bpf_probe_read_kernel_str(e->rename.new_comm, sizeof(e->rename.new_comm), comm);
-		submit_event(e);
 	}
 
 	return 0;
@@ -474,9 +540,8 @@ int BPF_PROG(wprof_task_fork, struct task_struct *parent, struct task_struct *ch
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_SZ(fork), EV_FORK, now_ts, parent))) {
+	emit_task_event(e, EV_SZ(fork), 0, EV_FORK, now_ts, parent) {
 		fill_task_info(child, &e->fork.child);
-		submit_event(e);
 	}
 
 	return 0;
@@ -492,10 +557,9 @@ int BPF_PROG(wprof_task_exec, struct task_struct *p, int old_pid, struct linux_b
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_SZ(exec), EV_EXEC, now_ts, p))) {
+	emit_task_event(e, EV_SZ(exec), 0, EV_EXEC, now_ts, p) {
 		e->exec.old_tid = old_pid;
 		bpf_probe_read_kernel_str(e->exec.filename, sizeof(e->exec.filename), bprm->filename);
-		submit_event(e);
 	}
 
 	return 0;
@@ -518,9 +582,7 @@ int BPF_PROG(wprof_task_exit, struct task_struct *p)
 
 	now_ts = bpf_ktime_get_ns();
 	
-	if ((e = prep_task_event(EV_SZ(task), EV_TASK_EXIT, now_ts, p))) {
-		submit_event(e);
-	}
+	emit_task_event(e, EV_SZ(task), 0, EV_TASK_EXIT, now_ts, p);
 
 	task_state_delete(p->pid);
 
@@ -537,9 +599,7 @@ int BPF_PROG(wprof_task_free, struct task_struct *p)
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_SZ(task), EV_TASK_FREE, now_ts, p))) {
-		submit_event(e);
-	}
+	emit_task_event(e, EV_SZ(task), 0, EV_TASK_FREE, now_ts, p);
 
 	return 0;
 }
@@ -568,7 +628,7 @@ static int handle_hardirq(struct task_struct *task, struct irqaction *action, in
 		return 0;
 
 	now_ts = bpf_ktime_get_ns();
-	if ((e = prep_task_event(EV_SZ(hardirq), EV_HARDIRQ_EXIT, now_ts, task))) {
+	emit_task_event(e, EV_SZ(hardirq), 0, EV_HARDIRQ_EXIT, now_ts, task) {
 		e->hardirq.hardirq_ts = s->hardirq_ts;
 		e->hardirq.irq = irq;
 		bpf_probe_read_kernel_str(&e->hardirq.name, sizeof(e->hardirq.name), action->name);
@@ -580,8 +640,6 @@ static int handle_hardirq(struct task_struct *task, struct irqaction *action, in
 			for (__u64 i = 0; i < perf_ctr_cnt; i++)
 				e->hardirq.ctrs.val[i] = ctrs.val[i] - s->hardirq_ctrs.val[i];
 		}
-
-		submit_event(e);
 	}
 
 	s->hardirq_ts = 0;
@@ -634,7 +692,7 @@ static int handle_softirq(struct task_struct *task, int vec_nr, bool start)
 	if (s->softirq_ts == 0) /* we never recorded matching start, ignore */
 		return 0;
 
-	if ((e = prep_task_event(EV_SZ(softirq), EV_SOFTIRQ_EXIT, now_ts, task))) {
+	emit_task_event(e, EV_SZ(softirq), 0, EV_SOFTIRQ_EXIT, now_ts, task) {
 		e->softirq.softirq_ts = s->softirq_ts;
 		e->softirq.vec_nr = vec_nr;
 
@@ -645,8 +703,6 @@ static int handle_softirq(struct task_struct *task, int vec_nr, bool start)
 			for (__u64 i = 0; i < perf_ctr_cnt; i++)
 				e->softirq.ctrs.val[i] = ctrs.val[i] - s->softirq_ctrs.val[i];
 		}
-
-		submit_event(e);
 	}
 
 	s->softirq_ts = 0;
@@ -726,7 +782,7 @@ static int handle_workqueue(struct task_struct *task, struct work_struct *work, 
 	if (s->wq_ts == 0) /* we never recorded matching start, ignore */
 		return 0;
 
-	if ((e = prep_task_event(EV_SZ(wq), EV_WQ_END, now_ts, task))) {
+	emit_task_event(e, EV_SZ(wq), 0, EV_WQ_END, now_ts, task) {
 		e->wq.wq_ts = s->wq_ts;
 		__builtin_memcpy(e->wq.desc, s->wq_name, sizeof(e->wq.desc));
 
@@ -737,8 +793,6 @@ static int handle_workqueue(struct task_struct *task, struct work_struct *work, 
 			for (__u64 i = 0; i < perf_ctr_cnt; i++)
 				e->wq.ctrs.val[i] = ctrs.val[i] - s->wq_ctrs.val[i];
 		}
-
-		submit_event(e);
 	}
 
 	s->wq_ts = 0;
