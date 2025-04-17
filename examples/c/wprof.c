@@ -49,6 +49,7 @@ static struct env {
 	bool libbpf_logs;
 	bool print_stats;
 	bool breakout_counters;
+	bool stack_traces;
 	int freq;
 	int stats_period_ms; 
 	int run_dur_ms;
@@ -76,6 +77,7 @@ static struct env {
 	.ringbuf_cnt = 1,
 	.task_state_sz = DEFAULT_TASK_STATE_SZ,
 	.stats_period_ms = DEFAULT_STATS_PERIOD_MS,
+	.stack_traces = true,
 };
 
 const char *argp_program_version = "wprof 0.0";
@@ -861,14 +863,14 @@ static bool enc_annotations(pb_ostream_t *stream, const pb_field_t *field, void 
 
 #define PB_ANNOTATIONS(p) ((pb_callback_t){{.encode=enc_annotations}, (void *)(p)})
 
-struct pb_intern_range {
+struct pb_str_iid_range {
 	int start_id;
 	int end_id;
 };
 
-static bool enc_intern_range(pb_ostream_t *stream, const pb_field_t *field, void * const *arg)
+static bool enc_str_iid_range(pb_ostream_t *stream, const pb_field_t *field, void * const *arg)
 {
-	const struct pb_intern_range *intern_set = *arg;
+	const struct pb_str_iid_range *intern_set = *arg;
 
 	for (int iid = intern_set->start_id; iid < intern_set->end_id; iid++) {
 		InternedString pb = {
@@ -890,14 +892,14 @@ static bool enc_intern_range(pb_ostream_t *stream, const pb_field_t *field, void
 	return true;
 }
 
-struct pb_intern_pair {
+struct pb_str_iid {
 	pb_iid iid;
 	const char *s;
 };
 
-static bool enc_intern_pair(pb_ostream_t *stream, const pb_field_t *field, void * const *arg)
+static bool enc_str_iid(pb_ostream_t *stream, const pb_field_t *field, void * const *arg)
 {
-	const struct pb_intern_pair *pair = *arg;
+	const struct pb_str_iid *pair = *arg;
 	InternedString pb = {
 		PB_INIT(iid) = pair->iid,
 		.str = PB_STRING(pair->s),
@@ -911,9 +913,108 @@ static bool enc_intern_pair(pb_ostream_t *stream, const pb_field_t *field, void 
 	return true;
 }
 
-#define PB_IID_RANGE(start_id, end_id) ((pb_callback_t){{.encode=enc_intern_range}, (void *)&((struct pb_intern_range){ start_id, end_id })})
+struct pb_str_iids {
+	int cnt, cap;
+	int *iids;
+	const char **strs;
+};
 
-#define PB_IID_PAIR(iid, str) ((pb_callback_t){{.encode=enc_intern_pair}, (void *)&((struct pb_intern_pair){ iid, str })})
+static bool enc_str_iids(pb_ostream_t *stream, const pb_field_t *field, void * const *arg)
+{
+	const struct pb_str_iids *iids = *arg;
+
+	for (int i = 0; i < iids->cnt; i++) {
+		InternedString pb = {
+			PB_INIT(iid) = iids->iids[i],
+			.str = PB_STRING(iids->strs[i]),
+		};
+
+		if (!pb_encode_tag_for_field(stream, field))
+			return false;
+		if (!pb_encode_submessage(stream, perfetto_protos_InternedString_fields, &pb))
+			return false;
+	}
+
+	return true;
+}
+
+#define PB_STR_IID_RANGE(start_id, end_id) ((pb_callback_t){{.encode=enc_str_iid_range}, (void *)&((struct pb_str_iid_range){ start_id, end_id })})
+#define PB_STR_IID(iid, str) ((pb_callback_t){{.encode=enc_str_iid}, (void *)&((struct pb_str_iid){ iid, str })})
+#define PB_STR_IIDS(p) ((pb_callback_t){{.encode=enc_str_iids}, (void *)(p)})
+
+struct pb_frame {
+	int iid;
+	int function_name_id;
+	__u64 rel_pc;
+};
+
+struct pb_frame_iids {
+	int cnt, cap;
+	struct pb_frame *frames;
+};
+
+struct pb_callstack {
+	int iid;
+	int frame_cnt;
+	int *frame_ids;
+};
+
+struct pb_callstack_iids {
+	int cnt, cap;
+	struct pb_callstack *callstacks;
+};
+
+static void append_str_iid(struct pb_str_iids *iids, int iid, const char *s)
+{
+	if (iids->cnt == iids->cap) {
+		int new_cap = iids->cnt < 1024 ? 1024 : iids->cnt * 4 / 3;
+		iids->iids = realloc(iids->iids, new_cap * sizeof(*iids->iids));
+		iids->strs = realloc(iids->strs, new_cap * sizeof(*iids->strs));
+		iids->cap = new_cap;
+	}
+	iids->iids[iids->cnt] = iid;
+	iids->strs[iids->cnt] = s;
+	iids->cnt += 1;
+}
+
+static void append_frame_iid(struct pb_frame_iids *iids, int iid, int fname_iid, __u64 rel_pc)
+{
+	if (iids->cnt == iids->cap) {
+		int new_cap = iids->cnt < 256 ? 256 : iids->cnt * 4 / 3;
+		iids->frames = realloc(iids->frames, new_cap * sizeof(*iids->frames));
+		iids->cap = new_cap;
+	}
+	iids->frames[iids->cnt].iid = iid;
+	iids->frames[iids->cnt].function_name_id = fname_iid;
+	iids->frames[iids->cnt].rel_pc = rel_pc;
+	iids->cnt += 1;
+}
+
+static void append_callstack_frame_iid(struct pb_callstack_iids *iids, int iid, int frame_iid)
+{
+	struct pb_callstack *cs = NULL;
+
+	if (iids->cnt > 0 && iids->callstacks[iids->cnt - 1].iid == iid)
+		cs = &iids->callstacks[iids->cnt - 1];
+
+	if (!cs) {
+		if (iids->cnt == iids->cap) {
+			int new_cap = iids->cnt < 32 ? 32 : iids->cnt * 4 / 3;
+			iids->callstacks = realloc(iids->callstacks, new_cap * sizeof(*iids->callstacks));
+			iids->cap = new_cap;
+		}
+		iids->callstacks[iids->cnt].iid = iid;
+		iids->callstacks[iids->cnt].frame_cnt = 0;
+		iids->callstacks[iids->cnt].frame_ids = NULL;
+		cs = &iids->callstacks[iids->cnt];
+
+		iids->cnt += 1;
+	}
+
+	cs->frame_ids = realloc(cs->frame_ids, (cs->frame_cnt + 1) * sizeof(*cs->frame_ids));
+	cs->frame_ids[cs->frame_cnt] = frame_iid;
+	cs->frame_cnt++;
+}
 
 static pb_field_iter_t trace_pkt_it;
 
@@ -980,8 +1081,6 @@ static void emit_cleanup(struct emit_rec *r)
 /*
  * SYMBOLIZATION
  */
-static struct blaze_symbolizer *symbolizer;
-
 static void print_frame(const char *name, uintptr_t input_addr, uintptr_t addr, uint64_t offset,
 			const blaze_symbolize_code_info* code_info)
 {
@@ -1008,7 +1107,7 @@ static void print_frame(const char *name, uintptr_t input_addr, uintptr_t addr, 
 }
 
 __unused
-static void show_stack_trace(__u64 *stack, int stack_sz, pid_t pid)
+static void show_stack_trace(struct blaze_symbolizer *symbolizer, __u64 *stack, int stack_sz, pid_t pid)
 {
 	const struct blaze_symbolize_inlined_fn* inlined;
 	const struct blaze_syms *syms;
@@ -1525,10 +1624,10 @@ static int init_protobuf(pb_ostream_t *stream)
 			PB_ONEOF(name_field, TrackEvent_name) = { .name = PB_STRING("START") },
 		}},
 		PB_INIT(interned_data) = {
-			.event_categories = PB_IID_RANGE(CAT_START_IID, CAT_END_IID),
-			.event_names = PB_IID_RANGE(NAME_START_IID, NAME_END_IID),
-			.debug_annotation_names = PB_IID_RANGE(ANNK_START_IID, ANNK_END_IID),
-			.debug_annotation_string_values = PB_IID_RANGE(ANNV_START_IID, ANNV_END_IID),
+			.event_categories = PB_STR_IID_RANGE(CAT_START_IID, CAT_END_IID),
+			.event_names = PB_STR_IID_RANGE(NAME_START_IID, NAME_END_IID),
+			.debug_annotation_names = PB_STR_IID_RANGE(ANNK_START_IID, ANNK_END_IID),
+			.debug_annotation_string_values = PB_STR_IID_RANGE(ANNV_START_IID, ANNV_END_IID),
 		},
 	};
 	enc_trace_packet(stream, &ev_pb);
@@ -1595,8 +1694,8 @@ static void emit_process_track_descr(pb_ostream_t *stream, const struct wprof_ta
 			PB_INIT(sibling_order_rank) = track_process_rank(t),
 		}},
 		PB_INIT(interned_data) = {
-			.event_names = PB_IID_PAIR(pname_iid, pcomm),
-			.debug_annotation_string_values = PB_IID_PAIR(pname_iid, pcomm),
+			.event_names = PB_STR_IID(pname_iid, pcomm),
+			.debug_annotation_string_values = PB_STR_IID(pname_iid, pcomm),
 		}
 	};
 	enc_trace_packet(stream, &proc_desc);
@@ -1617,22 +1716,91 @@ static void emit_thread_track_descr(pb_ostream_t *stream, const struct wprof_tas
 			PB_INIT(sibling_order_rank) = track_thread_rank(t),
 		}},
 		PB_INIT(interned_data) = {
-			.event_names = PB_IID_PAIR(tname_iid, comm),
-			.debug_annotation_string_values = PB_IID_PAIR(tname_iid, comm),
+			.event_names = PB_STR_IID(tname_iid, comm),
+			.debug_annotation_string_values = PB_STR_IID(tname_iid, comm),
 		}
 	};
 	enc_trace_packet(stream, &thread_desc);
 }
 
-struct worker_state {
+struct str_iid_domain {
 	struct hashmap *str_iids;
 	int next_str_iid;
+	const char *domain_desc;
+};
+
+static pb_iid str_iid_for(struct str_iid_domain *d, const char *s, bool *new_iid)
+{
+	long iid;
+	char *sdup;
+
+	if (hashmap__find(d->str_iids, s, &iid)) {
+		if (new_iid)
+			*new_iid = false;
+		return iid;
+	}
+
+	sdup = strdup(s);
+	iid = d->next_str_iid++;
+
+	hashmap__set(d->str_iids, sdup, iid, NULL, NULL);
+
+	if (env.pb_debug_interns)
+		fprintf(stderr, "%03ld: %-20s [%s]\n", iid, sdup, d->domain_desc);
+	if (new_iid)
+		*new_iid = true;
+
+	return iid;
+}
+
+struct stack_trace_iids {
+	struct pb_str_iids func_names;
+	struct pb_frame_iids frames;
+	struct pb_callstack_iids callstacks;
+};
+
+struct stack_trace_index {
+	int orig_idx;
+	int pid;
+	int start_frame_idx;
+	int frame_cnt;
+	int callstack_iid;
+};
+
+struct frame_iid_list {
+	int cnt;
+	int *iids;
+};
+
+struct stack_frame_index {
+	int pid;
+	int orig_idx;
+	__u64 addr;
+	const struct blaze_sym *sym;
+	union {
+		/* if sym has no inlined frames */
+		int frame_iid;
+		/* if sym has inlined frames */
+		struct frame_iid_list *frame_iids;
+	} iid;
+};
+
+struct worker_state {
+	struct str_iid_domain name_iids;
 
 	FILE *trace;
 	pb_ostream_t stream;
 
 	char *dump_path;
 	FILE *dump;
+
+	struct blaze_symbolizer *symbolizer;
+	struct stack_frame_index *sframe_idx;
+	size_t sframe_cap, sframe_cnt;
+	struct stack_trace_index *strace_idx;
+	size_t strace_cap, strace_cnt;
+	struct stack_trace_iids strace_iids;
+	struct str_iid_domain fname_iids;
 
 	/* stats */
 	__u64 rb_handled_cnt;
@@ -1642,24 +1810,6 @@ struct worker_state {
 } __attribute__((aligned(64)));
 
 static struct worker_state *worker;
-
-static pb_iid str_iid_for(struct worker_state *w, const char *s)
-{
-	long iid;
-	char *sdup;
-
-	if (hashmap__find(w->str_iids, s, &iid))
-		return iid;
-
-	sdup = strdup(s);
-	iid = w->next_str_iid++;
-
-	hashmap__set(w->str_iids, sdup, iid, NULL, NULL);
-
-	if (env.pb_debug_interns)
-		fprintf(stderr, "%03ld: %-20s [dynamic]\n", iid, sdup);
-	return iid;
-}
 
 static struct task_state *task_state(struct worker_state *w, struct wprof_task *t)
 {
@@ -1671,7 +1821,7 @@ static struct task_state *task_state(struct worker_state *w, struct wprof_task *
 		st->tid = t->tid;
 		st->pid = t->pid;
 		strlcpy(st->comm, t->comm, sizeof(st->comm));
-		st->name_iid = str_iid_for(w, t->comm);
+		st->name_iid = str_iid_for(&w->name_iids, t->comm, NULL);
 
 		hashmap__set(tasks, key, st, NULL, NULL);
 
@@ -1683,13 +1833,13 @@ static struct task_state *task_state(struct worker_state *w, struct wprof_task *
 
 			if (t->tid == t->pid) {
 				/* we are the new task group leader */
-				emit_process_track_descr(&w->stream, t, str_iid_for(w, t->pcomm));
+				emit_process_track_descr(&w->stream, t, str_iid_for(&w->name_iids, t->pcomm, NULL));
 			} else if (!hashmap__find(tasks, pkey, &pst)) {
 				/* no task group leader task yet */
 				pst = calloc(1, sizeof(*st));
 				pst->tid = pst->pid = t->pid;
 				strlcpy(pst->comm, t->pcomm, sizeof(pst->comm));
-				pst->name_iid = str_iid_for(w, pst->comm);
+				pst->name_iid = str_iid_for(&w->name_iids, pst->comm, NULL);
 
 				hashmap__set(tasks, pkey, pst, NULL, NULL);
 
@@ -1756,34 +1906,312 @@ static int handle_event(void *ctx, void *data, size_t size)
 	return 0;
 }
 
-static int stack_cnt;
+static int stack_trace_cmp_by_content(const void *a, const void *b, void *ctx)
+{
+	const struct worker_state *w = ctx;
+	const struct stack_trace_index *x = a, *y = b;
 
-/* Receive events from the ring buffer. */
+	if (x->pid != y->pid)
+		return x->pid < y->pid ? -1 : 1;
+
+	if (x->frame_cnt != y->frame_cnt)
+		return x->frame_cnt < y->frame_cnt ? -1 : 1;
+
+	for (int i = 0; i < x->frame_cnt; i++) {
+		__u64 xa = w->sframe_idx[x->start_frame_idx + i].addr;
+		__u64 ya = w->sframe_idx[y->start_frame_idx + i].addr;
+
+		if (xa != ya)
+			return xa < ya ? -1 : 1;
+	}
+
+	return x->start_frame_idx < y->start_frame_idx ? -1 : 1;
+}
+
+static int stack_trace_cmp_by_orig_idx(const void *a, const void *b)
+{
+	const struct stack_trace_index *x = a, *y = b;
+
+	return x->orig_idx < y->orig_idx ? -1 : 1;
+}
+
+static int stack_frame_cmp_by_pid_addr(const void *a, const void *b)
+{
+	const struct stack_frame_index *x = a, *y = b;
+
+	if (x->pid != y->pid)
+		return x->pid < y->pid ? -1 : 1;
+	if (x->addr != y->addr)
+		return x->addr < y->addr ? -1 : 1;
+	return x->orig_idx < y->orig_idx ? -1 : 1;
+}
+
+static int stack_frame_cmp_by_orig_idx(const void *a, const void *b)
+{
+	const struct stack_frame_index *x = a, *y = b;
+
+	return x->orig_idx < y->orig_idx ? -1 : 1;
+}
+
+static void stack_trace_append(struct worker_state *w, int pid, int start_frame_idx, int frame_cnt)
+{
+	if (w->strace_cnt == w->strace_cap) {
+		size_t new_cap = w->strace_cnt < 64 ? 64 : w->strace_cnt * 4 / 3;
+
+		w->strace_idx = realloc(w->strace_idx, new_cap * sizeof(*w->strace_idx));
+		w->strace_cap = new_cap;
+	}
+	w->strace_idx[w->strace_cnt] = (struct stack_trace_index){
+		.orig_idx = w->strace_cnt,
+		.pid = pid,
+		.start_frame_idx = start_frame_idx,
+		.frame_cnt = frame_cnt,
+	};
+
+	w->strace_cnt++;
+}
+
+static void stack_frame_append(struct worker_state *w, int pid, __u64 addr)
+{
+	if (w->sframe_cnt == w->sframe_cap) {
+		size_t new_cap = w->sframe_cnt < 256 ? 256 : w->sframe_cnt * 4 / 3;
+
+		w->sframe_idx = realloc(w->sframe_idx, new_cap * sizeof(*w->sframe_idx));
+		w->sframe_cap = new_cap;
+	}
+	w->sframe_idx[w->sframe_cnt] = (struct stack_frame_index){
+		.orig_idx = w->sframe_cnt,
+		.pid = pid,
+		.addr = addr,
+		.sym = NULL,
+	};
+
+	w->sframe_cnt++;
+}
+
+static int process_event_stack_trace(struct worker_state *w, struct wprof_event *e, size_t size)
+{
+	struct stack_trace *tr;
+	const __u64 *addrs;
+
+	if (e->sz == size) /* no variable-length part of event */
+		return 0;
+
+	tr = (void *)e + e->sz;
+	addrs = tr->addrs;
+
+	if (tr->kstack_sz > 0) {
+		int n = tr->kstack_sz / 8;
+
+		stack_trace_append(w, 0, w->sframe_cnt, n);
+		for (int i = 0; i < n; i++)
+			stack_frame_append(w, 0 /* kernel */, addrs[i]);
+			
+		addrs += n;
+	}
+
+	if (tr->ustack_sz > 0) {
+		int n = tr->ustack_sz / 8;
+
+		stack_trace_append(w, e->task.pid, w->sframe_cnt, n);
+		for (int i = 0; i < n; i++)
+			stack_frame_append(w, e->task.pid, addrs[i]);
+			
+		addrs += n;
+	}
+
+	return 0;
+}
+
+static int process_stack_traces(struct worker_state *w, const void *dump_mem, size_t dump_sz)
+{
+	struct wprof_event *rec;
+	size_t rec_sz, off, idx, kaddr_cnt = 0;
+	__u64 start_ns = ktime_now_ns();
+	int err;
+
+	if (!env.stack_traces)
+		return 0;
+
+	off = 0;
+	idx = 0;
+	while (off < dump_sz) {
+		rec_sz = *(size_t *)(dump_mem + off);
+		rec = (struct wprof_event *)(dump_mem + off + sizeof(rec_sz));
+		err = process_event_stack_trace(w, rec, rec_sz);
+		if (err) {
+			fprintf(stderr, "Failed to pre-process stack trace for event #%zu (kind %d, size %zu, offset %zu): %d\n",
+				idx, rec->kind, rec_sz, off, err);
+			return err;
+		}
+		off += sizeof(rec_sz) + rec_sz;
+		idx += 1;
+	}
+
+	struct blaze_symbolizer_opts blaze_opts = {
+		.type_size = sizeof(struct blaze_symbolizer_opts),
+		.auto_reload = true,
+		.code_info = true,
+		.inlined_fns = true,
+		.demangle = true,
+	};
+	w->symbolizer = blaze_symbolizer_new_opts(&blaze_opts);
+	if (!w->symbolizer) {
+		enum blaze_err berr = blaze_err_last();
+		const char *berr_str = blaze_err_str(berr);
+
+		fprintf(stderr, "Failed to create a symbolizer: %s (%d)\n", berr_str, berr);
+		return berr;
+	}
+
+	/* group by pid+addr */
+	qsort(w->sframe_idx, w->sframe_cnt, sizeof(*w->sframe_idx), stack_frame_cmp_by_pid_addr);
+
+	__u64 symb_start_ns = ktime_now_ns();
+	__u64 *addrs = NULL;
+	size_t addr_cnt = 0;
+	for (int start = 0, end = 1; end <= w->sframe_cnt; end++) {
+		if (end < w->sframe_cnt && w->sframe_idx[start].pid == w->sframe_idx[end].pid)
+			continue;
+
+		if (end - start > addr_cnt)
+			addrs = realloc(addrs, sizeof(*addrs) * (end - start));
+		addr_cnt = end - start;
+		for (int i = 0; i < end - start; i++)
+			addrs[i] = w->sframe_idx[start + i].addr;
+
+		/* symbolize [start .. end - 1] range */
+		const struct blaze_syms *syms;
+		if (w->sframe_idx[start].pid == 0) { /* kernel addresses */
+			struct blaze_symbolize_src_kernel src = {
+				.type_size = sizeof(src),
+				.debug_syms = true,
+			};
+			syms = blaze_symbolize_kernel_abs_addrs(w->symbolizer, &src,
+								 (const void *)addrs, addr_cnt);
+			kaddr_cnt += addr_cnt;
+		} else {
+			struct blaze_symbolize_src_process src = {
+				.type_size = sizeof(src),
+				.pid = w->sframe_idx[start].pid,
+				.map_files = true,
+				//.debug_syms = true,
+			};
+			syms = blaze_symbolize_process_abs_addrs(w->symbolizer, &src,
+								 (const void *)addrs, addr_cnt);
+		}
+		if (!syms) {
+			enum blaze_err berr = blaze_err_last();
+			const char *berr_str = blaze_err_str(berr);
+
+			fprintf(stderr, "Symbolization failed for PID %d: %s (%d)\n",
+				w->sframe_idx[start].pid, berr_str, berr);
+			return berr;
+		}
+
+		for (int i = 0; i < end - start; i++)
+			w->sframe_idx[start + i].sym = &syms->syms[i];
+
+		start = end;
+	}
+	free(addrs);
+
+	__u64 symb_end_ns = ktime_now_ns();
+	fprintf(stderr, "Symbolized %zu user and %zu kernel (%zu total) addresses in %.3lfms.\n",
+		w->sframe_cnt - kaddr_cnt, kaddr_cnt, w->sframe_cnt,
+		(symb_end_ns - symb_start_ns) / 1000000.0);
+
+	w->fname_iids = (struct str_iid_domain) {
+		.str_iids = hashmap__new(str_hash_fn, str_equal_fn, NULL),
+		.next_str_iid = 1,
+		.domain_desc = "func_name",
+	};
+
+	pb_iid unkn_iid = str_iid_for(&w->fname_iids, "<unknown>", NULL);
+	append_str_iid(&w->strace_iids.func_names, unkn_iid, "<unknown>");
+
+	pb_iid frame_iid = 1;
+	for (int i = 0; i < w->sframe_cnt; i++) {
+		struct stack_frame_index *f = &w->sframe_idx[i];
+		struct frame_iid_list *frame_iids = NULL;
+		bool new_iid = false;
+		pb_iid fname_iid = unkn_iid;
+
+		if (i > 0 && w->sframe_idx[i - 1].pid == f->pid && w->sframe_idx[i - 1].addr == f->addr) {
+			f->iid = w->sframe_idx[i - 1].iid;
+			continue;
+		}
+
+		if (f->sym->inlined_cnt > 0) {
+			frame_iids = f->iid.frame_iids = calloc(1, sizeof(*f->iid.frame_iids));
+			frame_iids->cnt = f->sym->inlined_cnt + 1;
+		}
+
+		for (int j = 0, n = f->sym->inlined_cnt + 1; j < n; j++) {
+			const char *sym_name = j == 0 ? f->sym->name : f->sym->inlined[j - 1].name;
+			size_t offset = j == 0 ? (f->sym->name ? f->sym->offset : f->addr) : 0;
+
+			if (sym_name && (fname_iid = str_iid_for(&w->fname_iids, sym_name, &new_iid)) && new_iid)
+				append_str_iid(&w->strace_iids.func_names, fname_iid, sym_name);
+
+			append_frame_iid(&w->strace_iids.frames, frame_iid, fname_iid, offset);
+
+			if (frame_iids)
+				frame_iids->iids[j] = frame_iid;
+			else
+				f->iid.frame_iid = frame_iid;
+
+			frame_iid += 1;
+		}
+	}
+
+	qsort(w->sframe_idx, w->sframe_cnt, sizeof(*w->sframe_idx), stack_frame_cmp_by_orig_idx);
+
+	qsort_r(w->strace_idx, w->strace_cnt, sizeof(*w->strace_idx), stack_trace_cmp_by_content, w);
+
+	pb_iid trace_iid = 1;
+	for (int i = 0; i < w->strace_cnt; i++) {
+		struct stack_trace_index *t = &w->strace_idx[i];
+		
+		if (i > 0 && stack_trace_cmp_by_content(&w->strace_idx[i - 1], t, w) == 0) {
+			t->callstack_iid = w->strace_idx[i - 1].callstack_iid;
+			continue;
+		}
+
+		for (int j = 0; j < t->frame_cnt; j++) {
+			const struct stack_frame_index *f = &w->sframe_idx[t->start_frame_idx + j];
+
+			for (int k = 0, n = f->sym->inlined_cnt + 1; k < n; k++) {
+				pb_iid frame_iid = f->sym->inlined_cnt > 0 ? f->iid.frame_iids->iids[k] : f->iid.frame_iid;
+
+				append_callstack_frame_iid(&w->strace_iids.callstacks, trace_iid, frame_iid);
+			}
+		}
+
+		t->callstack_iid = trace_iid;
+		trace_iid += 1;
+	}
+
+	qsort(w->sframe_idx, w->sframe_cnt, sizeof(*w->sframe_idx), stack_frame_cmp_by_orig_idx);
+
+	__u64 end_ns = ktime_now_ns();
+	fprintf(stderr, "Stack trace processing (%zu stack traces with %zu addrs total) done in %.3lfms.\n",
+		w->strace_cnt, w->sframe_cnt, (end_ns - start_ns) / 1000000.0);
+
+	for (int i = 0; i < w->sframe_cnt; i++) {
+		fprintf(stderr, "Frame #%d: PID %d ADDR %lx -> %s+0x%lx\n", i, w->sframe_idx[i].pid, w->sframe_idx[i].addr, w->sframe_idx[i].sym->name ?: "<unknown>");
+	}
+
+	//blaze_syms_free(syms);
+	return 0;
+}
+
 static int process_event(struct worker_state *w, struct wprof_event *e, size_t size)
 {
 	const char *status;
 	struct task_state *st, *pst = NULL, *fst = NULL, *nst = NULL;
-	struct stack_trace *tr = NULL;
 
 	st = task_state(w, &e->task);
-
-	if (e->sz < size && stack_cnt++ < 100) {
-		tr = (void *)e + e->sz;
-		if (tr->kstack_sz > 0) {
-			printf("Kernel:\n");
-			show_stack_trace(tr->addrs, tr->kstack_sz / sizeof(__u64), 0);
-		} else {
-			printf("No Kernel Stack\n");
-		}
-
-		if (tr->ustack_sz > 0) {
-			printf("Userspace:\n");
-			show_stack_trace(tr->addrs + (tr->kstack_sz >= 0 ? tr->kstack_sz: 0) / 8,
-					 tr->ustack_sz / sizeof(__u64), e->task.pid);
-		} else {
-			printf("No Userspace Stack\n");
-		}
-	}
 
 	switch (e->kind) {
 	case EV_TIMER:
@@ -1985,7 +2413,7 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 				emit_kv_str(IID_ANNK_NEW_NAME, "new_name", IID_NONE, e->rename.new_comm);
 			}
 
-			st->rename_iid = str_iid_for(w, e->rename.new_comm);
+			st->rename_iid = str_iid_for(&w->name_iids, e->rename.new_comm, NULL);
 			emit_thread_track_descr(&w->stream, &e->task, st->rename_iid, e->rename.new_comm);
 			break;
 		}
@@ -2105,27 +2533,6 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 	       e->task.comm, e->task.tid, e->task.pid, e->cpu,
 	       status, 0LL /* e->dur_ns / 1000 */);
 
-	/*
-	if (e->kstack_sz <= 0 && e->ustack_sz <= 0)
-		return 1;
-
-	if (e->kstack_sz > 0) {
-		printf("Kernel:\n");
-		show_stack_trace(e->kstack, e->kstack_sz / sizeof(__u64), 0);
-	} else {
-		printf("No Kernel Stack\n");
-	}
-
-	if (e->ustack_sz > 0) {
-		printf("Userspace:\n");
-		show_stack_trace(e->ustack, e->ustack_sz / sizeof(__u64), e->pid);
-	} else {
-		printf("No Userspace Stack\n");
-	}
-
-	printf("\n");
-	*/
-
 	return 0;
 }
 
@@ -2144,7 +2551,7 @@ static int process_raw_dump(struct worker_state *w)
 {
 	void *dump_mem;
 	struct wprof_event *rec;
-	size_t dump_sz, rec_sz, off;
+	size_t dump_sz, rec_sz, off, idx;
 	int err;
 
 	cur_stream = &w->stream;
@@ -2159,16 +2566,25 @@ static int process_raw_dump(struct worker_state *w)
 		return err;
 	}
 
+	err = process_stack_traces(w, dump_mem, dump_sz);
+	if (err) {
+		fprintf(stderr, "Failed to process stack traces: %d\n", err);
+		return err;
+	}
+
 	off = 0;
+	idx = 0;
 	while (off < dump_sz) {
 		rec_sz = *(size_t *)(dump_mem + off);
 		rec = (struct wprof_event *)(dump_mem + off + sizeof(rec_sz));
 		err = process_event(w, rec, rec_sz);
 		if (err) {
-			fprintf(stderr, "Failed to process record: %d\n", err);
+			fprintf(stderr, "Failed to process event #%zu (kind %d, size %zu, offset %zu): %d\n",
+				idx, rec->kind, rec_sz, off, err);
 			return err; /* YEAH, I know about all the clean up, whatever */
 		}
 		off += sizeof(rec_sz) + rec_sz;
+		idx += 1;
 	}
 
 	err = munmap(dump_mem, dump_sz);
@@ -2257,12 +2673,12 @@ skip_prog_stats:
 		ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1000000.0);
 	fprintf(stderr, "\tMemory (max RSS, MB):\t\t\t%.3lf\n",
 		ru.ru_maxrss / 1024.0);
-	fprintf(stderr, "\tPage faults (maj/min, M)\t\t%.3lf/%.3lf\n",
-		ru.ru_majflt / 1000000.0, ru.ru_minflt / 1000000.0);
+	fprintf(stderr, "\tPage faults (maj/min, K)\t\t%.3lf/%.3lf\n",
+		ru.ru_majflt / 1000.0, ru.ru_minflt / 1000.0);
 	fprintf(stderr, "\tBlock I/Os (K):\t\t\t\t%.3lf/%.3lf\n",
 		ru.ru_inblock / 1000.0, ru.ru_oublock / 1000.0);
-	fprintf(stderr, "\tContext switches (vol/invol, M):\t%.3lf/%.3lf\n",
-		ru.ru_nvcsw / 1000000.0, ru.ru_nivcsw / 1000000.0);
+	fprintf(stderr, "\tContext switches (vol/invol, K):\t%.3lf/%.3lf\n",
+		ru.ru_nvcsw / 1000.0, ru.ru_nivcsw / 1000.0);
 
 skip_rusage:
 	struct wprof_stats *stats;
@@ -2386,6 +2802,8 @@ int main(int argc, char **argv)
 	while ((1ULL << skel->rodata->rb_cnt_bits) < env.ringbuf_cnt)
 		skel->rodata->rb_cnt_bits++;
 
+	skel->rodata->capture_stack_traces = env.stack_traces;
+
 	if (env.bpf_stats) {
 		stats_fd = bpf_enable_stats(BPF_STATS_RUN_TIME);
 		if (stats_fd < 0)
@@ -2419,19 +2837,15 @@ int main(int argc, char **argv)
 		ringbuf_fds[i] = map_fd;
 	}
 
-	symbolizer = blaze_symbolizer_new();
-	if (!symbolizer) {
-		fprintf(stderr, "Failed to create a symbolizer\n");
-		err = -1;
-		goto cleanup;
-	}
-
 	struct worker_state *w = calloc(1, sizeof(*w));
 	char tmp_path[] = "wprof.dump.XXXXXX";
 	int tmp_fd;
 
-	w->str_iids = hashmap__new(str_hash_fn, str_equal_fn, NULL);
-	w->next_str_iid = IID_FIXED_LAST_ID;
+	w->name_iids = (struct str_iid_domain) {
+		.str_iids = hashmap__new(str_hash_fn, str_equal_fn, NULL),
+		.next_str_iid = IID_FIXED_LAST_ID,
+		.domain_desc = "dynamic",
+	};
 
 	tmp_fd = mkstemp(tmp_path);
 	if (tmp_fd < 0) {
@@ -2673,7 +3087,8 @@ cleanup2:
 	print_exit_summary(skel, num_cpus, err);
 
 	wprof_bpf__destroy(skel);
-	blaze_symbolizer_free(symbolizer);
+	if (worker && worker->symbolizer)
+		blaze_symbolizer_free(worker->symbolizer);
 	free(online_mask);
 	return -err;
 }

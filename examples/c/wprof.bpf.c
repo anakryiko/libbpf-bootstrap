@@ -401,10 +401,18 @@ int BPF_PROG(wprof_task_switch,
 	snext->ts = now_ts;
 	snext->waking_ts = 0;
 
+	struct bpf_dynptr *dptr;
+	struct stack_trace *strace = NULL;
+	size_t dyn_sz = 0;
+	size_t fix_sz = EV_SZ(swtch_from);
 
-	emit_task_event(e, EV_SZ(swtch_from), 0, EV_SWITCH_FROM, now_ts, prev) {
+	if (capture_stack_traces)
+		strace = grab_stack_trace(ctx, &dyn_sz);
+
+	emit_task_event_dyn(e, dptr, fix_sz, dyn_sz, EV_SWITCH_FROM, now_ts, prev) {
 		e->swtch_from.ctrs = counters;
 		fill_task_info(next, &e->swtch_from.next);
+		emit_stack_trace(strace, dyn_sz, dptr, fix_sz);
 	}
 
 	emit_task_event(e, EV_SZ(swtch_to), 0, EV_SWITCH_TO, now_ts, next) {
