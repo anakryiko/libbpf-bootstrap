@@ -110,6 +110,7 @@ int main(int argc, char **argv)
 			do {
 				for (i = 0; i < iter_num; i++) {
 					sink = sqrt(sink * sink);
+					(void)read(-1, NULL, 0);
 				}
 			} while (now_ns() - start_ts < env.on_dur_ms * 1000000ULL);
 		}

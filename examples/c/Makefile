@@ -23,7 +23,7 @@ VMLINUX := ../../vmlinux.h/include/$(ARCH)/vmlinux.h
 # libbpf to avoid dependency on system-wide headers, which could be missing or
 # outdated
 INCLUDES := -I$(OUTPUT) -I../../libbpf/include/uapi -I$(dir $(VMLINUX)) -I$(LIBBLAZESYM_INC)
-CFLAGS := -g -Wall -O$(if $(RELEASE),2,0)
+CFLAGS := -g -Wall -O$(if $(RELEASE),2,0) -fno-omit-frame-pointer
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
 APPS = minimal minimal_legacy minimal_ns bootstrap uprobe kprobe fentry \
