@@ -2567,9 +2567,12 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 				PB_ONEOF(data, TracePacket_perf_sample) = { .perf_sample = {
 					PB_INIT(pid) = track_pid(&e->task),
 					PB_INIT(tid) = track_tid(&e->task),
-					PB_INIT(callstack_iid) = w->strace_idx[strace_id].callstack_iid,
 				}},
 			};
+			if (strace_id >= 0) {
+				pb.data.perf_sample.has_callstack_iid = true;
+				pb.data.perf_sample.callstack_iid = w->strace_idx[strace_id].callstack_iid;
+			}
 			enc_trace_packet(&w->stream, &pb);
 			break;
 		case EV_SWITCH_FROM: {
@@ -2640,9 +2643,12 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 				PB_ONEOF(data, TracePacket_perf_sample) = { .perf_sample = {
 					PB_INIT(pid) = track_pid(&e->task),
 					PB_INIT(tid) = track_tid(&e->task),
-					PB_INIT(callstack_iid) = w->strace_idx[strace_id].callstack_iid,
 				}},
 			};
+			if (strace_id >= 0) {
+				pb.data.perf_sample.has_callstack_iid = true;
+				pb.data.perf_sample.callstack_iid = w->strace_idx[strace_id].callstack_iid;
+			}
 			enc_trace_packet(&w->stream, &pb);
 
 			if (st->rename_ts) {
