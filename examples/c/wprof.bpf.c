@@ -448,7 +448,7 @@ int BPF_PROG(wprof_task_waking, struct task_struct *p)
 	now_ts = bpf_ktime_get_ns();
 	s->waking_ts = now_ts;
 	s->waking_cpu = bpf_get_smp_processor_id();
-	s->waking_flags = WF_AWOKEN;
+	s->waking_flags = WF_WOKEN;
 	task = bpf_get_current_task_btf();
 	fill_task_info(task, &s->waking_task);
 
@@ -479,7 +479,7 @@ int BPF_PROG(wprof_task_wakeup_new, struct task_struct *p)
 	if (s->waking_ts == 0) {
 		s->waking_ts = now_ts;
 		s->waking_cpu = bpf_get_smp_processor_id();
-		s->waking_flags = WF_AWOKEN_NEW;
+		s->waking_flags = WF_WOKEN_NEW;
 		task = bpf_get_current_task_btf();
 		fill_task_info(task, &s->waking_task);
 	}

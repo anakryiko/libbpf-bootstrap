@@ -460,8 +460,8 @@ enum pb_static_iid {
 		IID_NAME_WAKEUP,				/* WAKEUP */
 		IID_NAME_WAKEUP_NEW,				/* WAKEUP_NEW */
 		IID_NAME_WAKING,				/* WAKING */
-		IID_NAME_AWOKEN_NEW,				/* AWOKEN_NEW */
-		IID_NAME_AWAKING,				/* AWAKING */
+		IID_NAME_WOKEN_NEW,				/* WOKEN_NEW */
+		IID_NAME_WOKEN,					/* WOKEN */
 		IID_NAME_FORKING,				/* FORKING */
 		IID_NAME_FORKED,				/* FORKED */
 		IID_NAME_RENAME,				/* RENAME */
@@ -533,8 +533,8 @@ static const char *pb_strs[] = {
 	[IID_NAME_WAKEUP] = "WAKEUP",
 	[IID_NAME_WAKEUP_NEW] = "WAKEUP_NEW",
 	[IID_NAME_WAKING] = "WAKING",
-	[IID_NAME_AWOKEN_NEW] = "AWOKEN_NEW",
-	[IID_NAME_AWAKING] = "AWAKING",
+	[IID_NAME_WOKEN_NEW] = "WOKEN_NEW",
+	[IID_NAME_WOKEN] = "WOKEN",
 	[IID_NAME_FORKING] = "FORKING",
 	[IID_NAME_FORKED] = "FORKED",
 	[IID_NAME_RENAME] = "RENAME",
@@ -1594,8 +1594,8 @@ static const char *waking_reason_str(enum waking_flags flags)
 {
 	switch (flags) {
 		case WF_UNKNOWN: return "unknown";
-		case WF_AWOKEN: return "awoken";
-		case WF_AWOKEN_NEW: return "awoken_new";
+		case WF_WOKEN: return "woken";
+		case WF_WOKEN_NEW: return "woken_new";
 		case WF_PREEMPTED: return "preempted";
 		default: return "???";
 	}
@@ -2202,6 +2202,7 @@ static int process_stack_traces(struct worker_state *w, const void *dump_mem, si
 {
 	struct wprof_event *rec;
 	size_t rec_sz, off, idx, kaddr_cnt = 0, uaddr_cnt = 0, unkn_cnt = 0, comb_cnt = 0;
+	size_t frames_deduped = 0, frames_total = 0, frames_failed = 0, callstacks_deduped = 0;
 	__u64 start_ns = ktime_now_ns();
 	int err;
 
@@ -2365,7 +2366,6 @@ static int process_stack_traces(struct worker_state *w, const void *dump_mem, si
 	append_str_iid(&w->strace_iids.func_names, unkn_iid, "<unknown>");
 
 	char sym_buf[1024];
-	size_t frames_deduped = 0, frames_total = 0, frames_failed = 0;
 	pb_iid frame_iid = 1;
 	for (int i = 0; i < w->sframe_cnt; i++) {
 		struct stack_frame_index *f = &w->sframe_idx[i];
@@ -2439,7 +2439,6 @@ static int process_stack_traces(struct worker_state *w, const void *dump_mem, si
 	/* dedup and assign callstack IIDs */
 	qsort_r(w->strace_idx, w->strace_cnt, sizeof(*w->strace_idx), stack_trace_cmp_by_content, w);
 
-	size_t callstacks_deduped = 0;
 	pb_iid trace_iid = 1;
 	for (int i = 0; i < w->strace_cnt; i++) {
 		struct stack_trace_index *t = &w->strace_idx[i];
@@ -2660,8 +2659,8 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 
 				/* event on awaker's timeline */
 				emit_instant(e->swtch_to.waking_ts, &e->swtch_to.waking,
-					     e->swtch_to.waking_flags == WF_AWOKEN_NEW ? IID_NAME_WAKEUP_NEW : IID_NAME_WAKING,
-					     e->swtch_to.waking_flags == WF_AWOKEN_NEW ? "WAKEUP_NEW" : "WAKING") {
+					     e->swtch_to.waking_flags == WF_WOKEN_NEW ? IID_NAME_WAKEUP_NEW : IID_NAME_WAKING,
+					     e->swtch_to.waking_flags == WF_WOKEN_NEW ? "WAKEUP_NEW" : "WAKING") {
 					emit_kv_int(IID_ANNK_CPU, "cpu", e->swtch_to.waking_cpu);
 					emit_kv_str(IID_ANNK_WAKING_TARGET, "waking_target", st->name_iid, e->task.comm);
 					emit_kv_int(IID_ANNK_WAKING_TARGET_TID, "waking_target_tid", task_tid(&e->task));
@@ -2671,8 +2670,8 @@ static int process_event(struct worker_state *w, struct wprof_event *e, size_t s
 				/* event on awoken's timeline */
 				if (e->swtch_to.waking_cpu != e->cpu) {
 					emit_instant(e->swtch_to.waking_ts, &e->task,
-						     e->swtch_to.waking_flags == WF_AWOKEN_NEW ? IID_NAME_AWOKEN_NEW : IID_NAME_AWAKING,
-						     e->swtch_to.waking_flags == WF_AWOKEN_NEW ? "AWOKEN_NEW" : "AWAKING") {
+						     e->swtch_to.waking_flags == WF_WOKEN_NEW ? IID_NAME_WOKEN_NEW : IID_NAME_WOKEN,
+						     e->swtch_to.waking_flags == WF_WOKEN_NEW ? "WOKEN_NEW" : "WOKEN") {
 						emit_kv_int(IID_ANNK_CPU, "cpu", e->cpu);
 					}
 				}

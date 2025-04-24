@@ -76,8 +76,8 @@ struct perf_counters {
 
 enum waking_flags {
 	WF_UNKNOWN,
-	WF_AWOKEN,
-	WF_AWOKEN_NEW,
+	WF_WOKEN,
+	WF_WOKEN_NEW,
 	WF_PREEMPTED,
 };
 
